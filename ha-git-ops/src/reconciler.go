@@ -593,10 +593,21 @@ func (r *Reconciler) Revert(rel string) error {
 func (r *Reconciler) Promote(rels []string, message string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// Start from a clean worktree at the remote head so leftovers from a
+	// previously failed promote (staged files, unpushed commits) can't
+	// poison this attempt. Live state is the source of truth for what
+	// gets promoted, so nothing is lost by discarding local repo state.
+	if _, err := r.git("fetch", "origin", r.opts.Branch); err != nil {
+		return err
+	}
+	if _, err := r.git("reset", "--hard", "origin/"+r.opts.Branch); err != nil {
+		return err
+	}
 	for _, rel := range rels {
 		liveB := r.live(rel)
 		if liveB == nil {
-			if _, err := r.git("rm", "-q", r.opts.Subfolder+"/"+rel); err != nil {
+			if _, err := r.git("rm", "-q", "--ignore-unmatch",
+				r.opts.Subfolder+"/"+rel); err != nil {
 				return err
 			}
 			continue
@@ -630,18 +641,21 @@ func (r *Reconciler) Promote(rels []string, message string) error {
 			return err
 		}
 	}
-	if message == "" {
-		message = "promote: " + strings.Join(rels, ", ")
-	}
-	if _, err := r.git("commit", "-m", message); err != nil {
-		return err
-	}
-	if _, err := r.git("pull", "--rebase", "origin", r.opts.Branch); err != nil {
-		_, _ = r.git("rebase", "--abort")
-		return fmt.Errorf("promote conflicts with new upstream commits; sync first")
-	}
-	if _, err := r.git("push", "origin", "HEAD:"+r.opts.Branch); err != nil {
-		return err
+	if _, err := r.git("diff", "--cached", "--quiet"); err == nil {
+		// Nothing staged — repo already matches live (e.g. a retried
+		// promote that had in fact been pushed). Recompute and move on.
+		log.Printf("promote: nothing to commit for %v", rels)
+	} else {
+		if message == "" {
+			message = "promote: " + strings.Join(rels, ", ")
+		}
+		if _, err := r.git("commit", "-m", message); err != nil {
+			return err
+		}
+		if _, err := r.git("push", "origin", "HEAD:"+r.opts.Branch); err != nil {
+			_, _ = r.git("reset", "--hard", "origin/"+r.opts.Branch)
+			return fmt.Errorf("push failed, worktree reset — sync and retry: %v", err)
+		}
 	}
 	head, err := r.git("rev-parse", "HEAD")
 	if err != nil {

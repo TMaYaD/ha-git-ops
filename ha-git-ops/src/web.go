@@ -7,6 +7,7 @@ package main
 import (
 	_ "embed"
 	"html/template"
+	"log"
 	"net/http"
 	"strings"
 )
@@ -84,6 +85,7 @@ func NewWebUI(rec *Reconciler) http.Handler {
 			return
 		}
 		if err := rec.Revert(rel); err != nil {
+			log.Printf("revert %s failed: %v", rel, err)
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -107,6 +109,7 @@ func NewWebUI(rec *Reconciler) http.Handler {
 			}
 		}
 		if err := rec.Promote(rels, req.FormValue("message")); err != nil {
+			log.Printf("promote %v failed: %v", rels, err)
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1
+
+- Promote is now self-healing: the worktree resets to the remote head
+  before staging, removals use --ignore-unmatch, and an empty stage is a
+  graceful no-op. A failed promote (e.g. rejected push) can no longer
+  poison retries with leftover commits. Promote/revert errors are also
+  logged, not just returned to the browser.
+
 ## 0.2.0
 
 - Tier 2: storage-mode Lovelace dashboards. `.storage/lovelace.<id>`
