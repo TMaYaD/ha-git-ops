@@ -50,5 +50,15 @@
   is deliberately not applied — delete the dashboard in the UI and
   promote instead.
 
-Helpers and registry state (`.storage` without dashboards) are the
-next roadmap tiers; see the repository README.
+- **Floors and labels**: `registry/floors.yaml` and
+  `registry/labels.yaml` hold a map keyed by the HA slug with the
+  human-meaningful fields (floors: name/level/icon/aliases; labels:
+  name/icon/color/description) — ids and timestamps stay out of git.
+  Apply converges the live registry item by item over the websocket API
+  (create/update/delete; a field absent in git is cleared live).
+  Deleting the whole file from git is refused as a registry-wipe guard;
+  remove individual items instead. New item keys must match HA's slug
+  of the name (lowercase, underscores). Empty registries don't surface.
+
+Helpers and the remaining registry state are the next roadmap tiers;
+see the repository README.

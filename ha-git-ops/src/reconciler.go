@@ -228,7 +228,7 @@ func (r *Reconciler) atRef(ref, rel string) []byte {
 		}
 		return dec
 	}
-	if isDashboard(rel) {
+	if isDashboard(rel) || isRegistry(rel) {
 		canon, err := CanonYAML(out)
 		if err != nil {
 			log.Printf("canonicalize %s@%.9s failed: %v", rel, ref, err)
@@ -284,6 +284,11 @@ func (r *Reconciler) managedRels(ref string) ([]string, error) {
 			rels = append(rels, rel)
 		}
 	}
+	for _, def := range registries {
+		if !seen[def.rel] && r.registryLive(def.rel) != nil {
+			rels = append(rels, def.rel)
+		}
+	}
 	sort.Strings(rels)
 	return rels, nil
 }
@@ -291,6 +296,9 @@ func (r *Reconciler) managedRels(ref string) ([]string, error) {
 func (r *Reconciler) live(rel string) []byte {
 	if isDashboard(rel) {
 		return r.dashboardLive(rel)
+	}
+	if isRegistry(rel) {
+		return r.registryLive(rel)
 	}
 	b, err := os.ReadFile(filepath.Join(r.configDir, rel))
 	if err != nil {
@@ -304,6 +312,9 @@ func (r *Reconciler) live(rel string) []byte {
 func (r *Reconciler) writeLive(rel string, content []byte) error {
 	if isDashboard(rel) {
 		return r.dashboardWrite(rel, content)
+	}
+	if isRegistry(rel) {
+		return r.registryWrite(rel, content)
 	}
 	target := filepath.Join(r.configDir, rel)
 	if content == nil {
@@ -474,11 +485,12 @@ func (r *Reconciler) apply(old, new_ string) error {
 }
 
 // activate reloads what it can and flags a restart for what it can't.
-// Dashboards need nothing: the websocket save is immediately live.
+// Dashboards and registries need nothing: websocket writes are
+// immediately live.
 func (r *Reconciler) activate(all []string) {
 	var rels []string
 	for _, rel := range all {
-		if !isDashboard(rel) {
+		if !isDashboard(rel) && !isRegistry(rel) {
 			rels = append(rels, rel)
 		}
 	}

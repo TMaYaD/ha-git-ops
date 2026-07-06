@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0
+
+- Tier-3 custom representations: floors and labels. Live registries
+  project to `registry/floors.yaml` / `registry/labels.yaml` keyed by
+  slug with human-meaningful fields only (no ids/timestamps). Apply
+  converges live per item — create/update/delete via the registry
+  websocket APIs; fields absent in git are cleared. Deleting the whole
+  file from git is refused. Empty registries don't surface. Item keys
+  must be HA's slug of the name (lowercase, underscores).
+
 ## 0.2.2
 
 - Replace post-action redirects with a small self-refreshing page — the

@@ -33,6 +33,6 @@ Roadmap:
 - **v1** — Tier 2: `.storage` JSON with faithful YAML forms translated to
   canonical YAML projections. Storage-mode dashboards ✓ 0.2.0; helpers
   next.
-- **v2** — Tier 3: baselines for registry-only state, plus custom
-  deterministic representations for meaningful values (floors, labels,
-  HACS manifest).
+- **v2** — Tier 3: custom deterministic representations for meaningful
+  registry values. Floors + labels ✓ 0.3.0; areas, dashboard registry,
+  HACS manifest, and baselines for the rest next.
