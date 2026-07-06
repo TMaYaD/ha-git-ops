@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -22,9 +23,23 @@ type HA struct {
 
 func NewHA() *HA {
 	return &HA{
-		token:  os.Getenv("SUPERVISOR_TOKEN"),
+		token:  containerEnv("SUPERVISOR_TOKEN"),
 		client: &http.Client{Timeout: 90 * time.Second},
 	}
+}
+
+// containerEnv reads a container environment variable. s6-overlay v3 (in
+// the HA base images) strips the environment for the CMD process and
+// exposes the container env as files instead.
+func containerEnv(name string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	b, err := os.ReadFile("/run/s6/container_environment/" + name)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
 }
 
 func (h *HA) req(method, path string, body any) (int, []byte, error) {

@@ -233,7 +233,8 @@ func (r *Reconciler) atRef(ref, rel string) []byte {
 func (r *Reconciler) decrypt(blob []byte) ([]byte, error) {
 	cmd := exec.Command("sops", "--decrypt",
 		"--input-type", "yaml", "--output-type", "yaml", "/dev/stdin")
-	cmd.Env = append(os.Environ(), "SOPS_AGE_KEY_FILE="+r.ageKeyFile)
+	cmd.Env = append(os.Environ(),
+		"SOPS_AGE_KEY_FILE="+r.ageKeyFile, "HOME=/data")
 	cmd.Stdin = bytes.NewReader(blob)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
@@ -557,6 +558,7 @@ func (r *Reconciler) Promote(rels []string, message string) error {
 			}
 			cmd := exec.Command("sops", "--encrypt", "--in-place", out)
 			cmd.Dir = r.repoDir
+			cmd.Env = append(os.Environ(), "HOME=/data")
 			if o, err := cmd.CombinedOutput(); err != nil {
 				return fmt.Errorf("sops encrypt: %v: %s", err, o)
 			}
