@@ -1,4 +1,6 @@
-# ha-git-ops
+<p align="center">
+  <img src="ha-git-ops/logo.png" alt="ha-git-ops" width="500">
+</p>
 
 ArgoCD-style GitOps for Home Assistant OS.
 
