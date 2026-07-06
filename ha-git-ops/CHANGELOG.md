@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.2
+
+- Skip files whose live content already matches the new desired state
+  during apply (e.g. sops re-encryption with unchanged plaintext) —
+  avoids spurious writes and false restart-required flags.
+
 ## 0.1.1
 
 - Fix: s6-overlay v3 strips the container environment for CMD — read

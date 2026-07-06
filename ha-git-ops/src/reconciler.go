@@ -367,6 +367,12 @@ func (r *Reconciler) apply(old, new_ string) error {
 			continue
 		}
 		want := r.atRef(new_, rel)
+		if want != nil && liveB != nil && bytes.Equal(liveB, want) {
+			// Live already has the desired content — e.g. a sops
+			// re-encryption that decrypts to the same plaintext. No
+			// write, no reload/restart.
+			continue
+		}
 		target := filepath.Join(r.configDir, rel)
 		if liveB != nil {
 			if err := os.MkdirAll(backupDir, 0o700); err != nil {
