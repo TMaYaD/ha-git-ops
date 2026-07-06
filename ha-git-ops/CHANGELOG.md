@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0
+
+- Tier 2: storage-mode Lovelace dashboards. `.storage/lovelace.<id>`
+  JSON ⇄ `dashboards/<url_path>.yaml` in git, compared in a canonical
+  sorted-key YAML form (formatting/key order never cause drift). Apply
+  and revert go through the websocket `lovelace/config/save` (no
+  restart); promote writes the canonical YAML. Live dashboards not in
+  git surface as "live only (promote to adopt)". Deleting dashboards
+  from git is intentionally not applied.
+
 ## 0.1.2
 
 - Skip files whose live content already matches the new desired state

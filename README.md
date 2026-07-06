@@ -29,9 +29,10 @@ decisions log) lives in that repo's `home-assistant/GITOPS.md`.
 Roadmap:
 
 - **v0** — apply loop + Tier 1 drift (plain YAML files) + ingress UI with
-  per-file diff, promote/revert. ← current
-- **v1** — Tier 2: `.storage` JSON with faithful YAML forms (storage-mode
-  dashboards, helpers) translated to canonical YAML projections.
+  per-file diff, promote/revert. ✓ 0.1.x
+- **v1** — Tier 2: `.storage` JSON with faithful YAML forms translated to
+  canonical YAML projections. Storage-mode dashboards ✓ 0.2.0; helpers
+  next.
 - **v2** — Tier 3: baselines for registry-only state, plus custom
   deterministic representations for meaningful values (floors, labels,
   HACS manifest).

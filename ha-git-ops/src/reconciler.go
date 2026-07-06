@@ -205,8 +205,9 @@ func (r *Reconciler) ensureRepo() error {
 	return nil
 }
 
-// atRef returns file content at a git ref (nil if absent). The secrets
-// file is decrypted, so callers always see the live-file shape.
+// atRef returns desired content at a git ref (nil if absent), in the
+// same shape live() produces: the secrets file decrypted, dashboards
+// canonicalized.
 func (r *Reconciler) atRef(ref, rel string) []byte {
 	src := rel
 	if rel == secretsPlain {
@@ -227,6 +228,14 @@ func (r *Reconciler) atRef(ref, rel string) []byte {
 		}
 		return dec
 	}
+	if isDashboard(rel) {
+		canon, err := CanonYAML(out)
+		if err != nil {
+			log.Printf("canonicalize %s@%.9s failed: %v", rel, ref, err)
+			return nil
+		}
+		return canon
+	}
 	return out
 }
 
@@ -244,12 +253,15 @@ func (r *Reconciler) decrypt(blob []byte) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-// desiredRels lists managed rel-paths at a ref, in live-file naming.
-func (r *Reconciler) desiredRels(ref string) ([]string, error) {
+// managedRels is the union of rel-paths tracked in git at ref (in
+// live-file naming) and live storage-mode dashboards, so click-ops
+// dashboards not yet in git surface as adoptable drift.
+func (r *Reconciler) managedRels(ref string) ([]string, error) {
 	out, err := r.git("ls-tree", "-r", "--name-only", ref, "--", r.opts.Subfolder)
 	if err != nil {
 		return nil, err
 	}
+	seen := map[string]bool{}
 	var rels []string
 	prefix := r.opts.Subfolder + "/"
 	for _, p := range strings.Split(strings.TrimSpace(out), "\n") {
@@ -260,17 +272,47 @@ func (r *Reconciler) desiredRels(ref string) ([]string, error) {
 		if rel == secretsSops {
 			rel = secretsPlain
 		}
+		seen[rel] = true
 		rels = append(rels, rel)
 	}
+	dbs, err := r.liveDashboards()
+	if err != nil {
+		return nil, err
+	}
+	for rel := range dbs {
+		if !seen[rel] {
+			rels = append(rels, rel)
+		}
+	}
+	sort.Strings(rels)
 	return rels, nil
 }
 
 func (r *Reconciler) live(rel string) []byte {
+	if isDashboard(rel) {
+		return r.dashboardLive(rel)
+	}
 	b, err := os.ReadFile(filepath.Join(r.configDir, rel))
 	if err != nil {
 		return nil
 	}
 	return b
+}
+
+// writeLive materializes desired content on the live side; nil content
+// means deletion.
+func (r *Reconciler) writeLive(rel string, content []byte) error {
+	if isDashboard(rel) {
+		return r.dashboardWrite(rel, content)
+	}
+	target := filepath.Join(r.configDir, rel)
+	if content == nil {
+		return os.Remove(target)
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(target, content, 0o644)
 }
 
 // ---------- reconcile ----------
@@ -373,7 +415,6 @@ func (r *Reconciler) apply(old, new_ string) error {
 			// write, no reload/restart.
 			continue
 		}
-		target := filepath.Join(r.configDir, rel)
 		if liveB != nil {
 			if err := os.MkdirAll(backupDir, 0o700); err != nil {
 				return err
@@ -383,15 +424,10 @@ func (r *Reconciler) apply(old, new_ string) error {
 				return err
 			}
 		}
-		if want == nil { // deleted in git
-			_ = os.Remove(target)
-		} else {
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return err
-			}
-			if err := os.WriteFile(target, want, 0o644); err != nil {
-				return err
-			}
+		if err := r.writeLive(rel, want); err != nil {
+			log.Printf("apply %s: %v", rel, err)
+			conflicts[rel] = err.Error()
+			continue
 		}
 		applied = append(applied, rel)
 	}
@@ -412,11 +448,11 @@ func (r *Reconciler) apply(old, new_ string) error {
 			for _, rel := range applied { // roll back everything we wrote
 				name := strings.ReplaceAll(rel, "/", "__")
 				saved, err := os.ReadFile(filepath.Join(backupDir, name))
-				target := filepath.Join(r.configDir, rel)
-				if err == nil {
-					_ = os.WriteFile(target, saved, 0o644)
-				} else {
-					_ = os.Remove(target)
+				if err != nil {
+					saved = nil
+				}
+				if err := r.writeLive(rel, saved); err != nil {
+					log.Printf("rollback %s: %v", rel, err)
 				}
 			}
 			r.ha.Notify("GitOps apply rolled back", fmt.Sprintf(
@@ -438,7 +474,17 @@ func (r *Reconciler) apply(old, new_ string) error {
 }
 
 // activate reloads what it can and flags a restart for what it can't.
-func (r *Reconciler) activate(rels []string) {
+// Dashboards need nothing: the websocket save is immediately live.
+func (r *Reconciler) activate(all []string) {
+	var rels []string
+	for _, rel := range all {
+		if !isDashboard(rel) {
+			rels = append(rels, rel)
+		}
+	}
+	if len(rels) == 0 {
+		return
+	}
 	needsRestart := false
 	for _, rel := range rels {
 		if restartFiles[rel] {
@@ -476,7 +522,7 @@ func (r *Reconciler) activate(rels []string) {
 
 func (r *Reconciler) computeDrift() error {
 	head := r.state.AppliedSHA
-	rels, err := r.desiredRels(head)
+	rels, err := r.managedRels(head)
 	if err != nil {
 		return err
 	}
@@ -485,6 +531,11 @@ func (r *Reconciler) computeDrift() error {
 		want := r.atRef(head, rel)
 		liveB := r.live(rel)
 		switch {
+		case want == nil && liveB == nil:
+			// registered dashboard with no config yet, or vanished both
+			// sides — nothing to reconcile
+		case want == nil:
+			drift[rel] = "live only (promote to adopt)"
 		case liveB == nil:
 			drift[rel] = "missing live"
 		case !bytes.Equal(liveB, want):
@@ -528,13 +579,8 @@ func (r *Reconciler) Revert(rel string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	want := r.atRef(r.state.AppliedSHA, rel)
-	target := filepath.Join(r.configDir, rel)
-	if want == nil {
-		_ = os.Remove(target)
-	} else {
-		if err := os.WriteFile(target, want, 0o644); err != nil {
-			return err
-		}
+	if err := r.writeLive(rel, want); err != nil {
+		return err
 	}
 	r.activate([]string{rel})
 	if err := r.computeDrift(); err != nil {
@@ -622,22 +668,38 @@ func (r *Reconciler) DiffText(rel string) string {
 	head := r.state.AppliedSHA
 	r.mu.Unlock()
 
-	want := r.atRef(head, rel)
-	tmp, err := os.CreateTemp("", "desired-*")
+	tmpFile := func(prefix string, content []byte) (string, error) {
+		if content == nil {
+			return os.DevNull, nil
+		}
+		tmp, err := os.CreateTemp("", prefix)
+		if err != nil {
+			return "", err
+		}
+		_, werr := tmp.Write(content)
+		cerr := tmp.Close()
+		if werr != nil || cerr != nil {
+			return "", fmt.Errorf("write temp: %v %v", werr, cerr)
+		}
+		return tmp.Name(), nil
+	}
+	wantPath, err := tmpFile("desired-*", r.atRef(head, rel))
 	if err != nil {
 		return err.Error()
 	}
-	defer os.Remove(tmp.Name())
-	_, _ = tmp.Write(want)
-	_ = tmp.Close()
-
-	livePath := filepath.Join(r.configDir, rel)
-	if _, err := os.Stat(livePath); err != nil {
-		livePath = os.DevNull
+	if wantPath != os.DevNull {
+		defer os.Remove(wantPath)
+	}
+	livePath, err := tmpFile("live-*", r.live(rel))
+	if err != nil {
+		return err.Error()
+	}
+	if livePath != os.DevNull {
+		defer os.Remove(livePath)
 	}
 	// git diff --no-index exits 1 when files differ; that's expected.
 	cmd := exec.Command("git", "diff", "--no-index",
-		"--src-prefix=git/", "--dst-prefix=live/", tmp.Name(), livePath)
+		"--src-prefix=git/", "--dst-prefix=live/", wantPath, livePath)
 	out, _ := cmd.Output()
 	return string(out)
 }

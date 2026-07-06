@@ -37,8 +37,18 @@
 
 ## Files it manages
 
-Exactly the files tracked in git under `subfolder` (plus the
-`secrets.sops.yaml` → `secrets.yaml` translation). Untracked live files
-are ignored in v0 — add a file to git to bring it under management.
-`.storage` translation (dashboards, helpers, registries) is the v1/v2
-roadmap; see the repository README.
+- Files tracked in git under `subfolder` (plus the `secrets.sops.yaml`
+  → `secrets.yaml` translation). Untracked live files are ignored — add
+  a file to git to bring it under management.
+- **Storage-mode Lovelace dashboards**: `dashboards/<url_path>.yaml` in
+  git maps to the live dashboard with that `url_path` (the unregistered
+  default dashboard maps to `dashboards/default.yaml`). Comparison is on
+  a canonical sorted-key YAML rendering, so formatting and key order
+  never show as drift. Apply/revert save through the websocket API and
+  take effect without a restart; live dashboards missing from git show
+  as "live only (promote to adopt)". Deleting a dashboard file from git
+  is deliberately not applied — delete the dashboard in the UI and
+  promote instead.
+
+Helpers and registry state (`.storage` without dashboards) are the
+next roadmap tiers; see the repository README.
