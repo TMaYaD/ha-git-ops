@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1
+
+- Hide the Revert button on "live only" dashboard/registry drift — there
+  is nothing in git to revert to and the guard refused it anyway; the
+  panel now says "not in git yet — promote to adopt".
+
 ## 0.3.0
 
 - Tier-3 custom representations: floors and labels. Live registries

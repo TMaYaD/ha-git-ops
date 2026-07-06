@@ -19,6 +19,7 @@ var page = template.Must(template.New("page").Parse(pageSrc))
 
 type fileView struct {
 	Rel, Why, Diff string
+	CanRevert      bool
 }
 
 // done returns a tiny self-refreshing page instead of a 303 — HA's
@@ -73,7 +74,8 @@ func NewWebUI(rec *Reconciler) http.Handler {
 		}
 		for _, rel := range sortedKeys(st.Drift) {
 			v.Files = append(v.Files, fileView{
-				Rel: rel, Why: st.Drift[rel], Diff: rec.DiffText(rel)})
+				Rel: rel, Why: st.Drift[rel], Diff: rec.DiffText(rel),
+				CanRevert: rec.CanRevert(rel)})
 		}
 		v.PromoteAll = len(v.Files) > 1
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")

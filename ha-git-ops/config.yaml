@@ -1,5 +1,5 @@
 name: HA GitOps
-version: 0.3.0
+version: 0.3.1
 slug: ha_git_ops
 description: ArgoCD-style GitOps reconciler — git is desired state, drift is surfaced for human promote/revert
 url: https://github.com/TMaYaD/ha-git-ops

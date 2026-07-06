@@ -42,10 +42,14 @@
 <header>
  <code>{{.Rel}}</code> <span>{{.Why}}</span>
  <span>
+  {{if .CanRevert}}
   <form method="post" action="./revert" style="display:inline">
    <input type="hidden" name="rel" value="{{.Rel}}">
    <button>Revert to git</button>
   </form>
+  {{else}}
+  <em>not in git yet — promote to adopt</em>
+  {{end}}
   <form method="post" action="./promote" style="display:inline">
    <input type="hidden" name="rel" value="{{.Rel}}">
    <input type="text" name="message" placeholder="commit message">

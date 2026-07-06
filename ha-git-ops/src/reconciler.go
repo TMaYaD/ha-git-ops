@@ -587,6 +587,19 @@ func sortedKeys(m map[string]string) []string {
 
 func (r *Reconciler) SyncNow() error { return r.Tick() }
 
+// CanRevert reports whether reverting rel is a supported operation.
+// A "live only" dashboard or registry has nothing in git to revert to —
+// reverting would delete live state, which those domains refuse.
+func (r *Reconciler) CanRevert(rel string) bool {
+	if !isDashboard(rel) && !isRegistry(rel) {
+		return true
+	}
+	r.mu.Lock()
+	head := r.state.AppliedSHA
+	r.mu.Unlock()
+	return r.atRef(head, rel) != nil
+}
+
 func (r *Reconciler) Revert(rel string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
