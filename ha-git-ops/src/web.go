@@ -21,6 +21,16 @@ type fileView struct {
 	Rel, Why, Diff string
 }
 
+// done returns a tiny self-refreshing page instead of a 303 — HA's
+// ingress iframe mishandles redirect responses to form POSTs and gets
+// stuck on a loading screen.
+func done(w http.ResponseWriter, what string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(`<!doctype html><meta http-equiv="refresh" content="1;url=./">` +
+		`<body style="font-family:system-ui;margin:1.5rem">✓ ` +
+		template.HTMLEscapeString(what) + ` — refreshing…</body>`))
+}
+
 type pageView struct {
 	StatusHTML      template.HTML
 	RestartRequired bool
@@ -75,7 +85,7 @@ func NewWebUI(rec *Reconciler) http.Handler {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		http.Redirect(w, req, "./", http.StatusSeeOther)
+		done(w, "synced")
 	})
 
 	mux.HandleFunc("POST /revert", func(w http.ResponseWriter, req *http.Request) {
@@ -89,7 +99,7 @@ func NewWebUI(rec *Reconciler) http.Handler {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		http.Redirect(w, req, "./", http.StatusSeeOther)
+		done(w, "reverted "+rel)
 	})
 
 	mux.HandleFunc("POST /promote", func(w http.ResponseWriter, req *http.Request) {
@@ -113,7 +123,7 @@ func NewWebUI(rec *Reconciler) http.Handler {
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}
-		http.Redirect(w, req, "./", http.StatusSeeOther)
+		done(w, "promoted")
 	})
 
 	return mux

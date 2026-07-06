@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2
+
+- Replace post-action redirects with a small self-refreshing page — the
+  HA ingress iframe gets stuck on "loading data" when a form POST
+  answers with a 303.
+
 ## 0.2.1
 
 - Promote is now self-healing: the worktree resets to the remote head
