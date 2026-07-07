@@ -1,6 +1,6 @@
 package main
 
-// Ingress UI: status, per-file diffs, promote / revert / sync actions.
+// Ingress UI: status, per-file diffs, refresh / apply / promote actions.
 // Served under HA ingress — all URLs are relative so the ingress path
 // prefix is transparent. Secrets diffs are masked to key names only.
 
@@ -36,8 +36,10 @@ type pageView struct {
 	StatusHTML      template.HTML
 	RestartRequired bool
 	Conflicts       []fileView
+	Incoming        []fileView
 	Files           []fileView
 	PromoteAll      bool
+	InSync          bool
 }
 
 func NewWebUI(rec *Reconciler) http.Handler {
@@ -48,7 +50,11 @@ func NewWebUI(rec *Reconciler) http.Handler {
 		if len(sha) > 9 {
 			sha = sha[:9]
 		}
-		v := pageView{RestartRequired: st.RestartRequired}
+		v := pageView{
+			RestartRequired: st.RestartRequired,
+			InSync: st.Error == "" && len(st.Conflicts) == 0 &&
+				len(st.Drift) == 0 && len(st.Incoming) == 0,
+		}
 
 		var status string
 		switch {
@@ -56,6 +62,8 @@ func NewWebUI(rec *Reconciler) http.Handler {
 			status = `<span class="bad">✗ ` + template.HTMLEscapeString(st.Error) + `</span>`
 		case len(st.Conflicts) > 0:
 			status = `<span class="bad">⚠ conflicts</span>`
+		case len(st.Incoming) > 0:
+			status = `<span class="info">↓ updates in git</span>`
 		case len(st.Drift) > 0:
 			status = `<span class="warn">● drift</span>`
 		default:
@@ -65,12 +73,16 @@ func NewWebUI(rec *Reconciler) http.Handler {
 		if last == "" {
 			last = "never"
 		}
-		v.StatusHTML = template.HTML(status + " — applied <code>" +
-			template.HTMLEscapeString(sha) + "</code>, last sync " +
-			template.HTMLEscapeString(last))
+		v.StatusHTML = template.HTML(status +
+			` <span class="nw">applied <code>` + template.HTMLEscapeString(sha) + `</code></span>` +
+			` <span class="nw">· last refresh ` + template.HTMLEscapeString(last) + `</span>`)
 
 		for _, rel := range sortedKeys(st.Conflicts) {
 			v.Conflicts = append(v.Conflicts, fileView{Rel: rel, Why: st.Conflicts[rel]})
+		}
+		for _, rel := range sortedKeys(st.Incoming) {
+			v.Incoming = append(v.Incoming, fileView{
+				Rel: rel, Why: st.Incoming[rel], Diff: rec.IncomingDiffText(rel)})
 		}
 		for _, rel := range sortedKeys(st.Drift) {
 			v.Files = append(v.Files, fileView{
@@ -82,12 +94,20 @@ func NewWebUI(rec *Reconciler) http.Handler {
 		_ = page.Execute(w, v)
 	})
 
-	mux.HandleFunc("POST /sync", func(w http.ResponseWriter, req *http.Request) {
-		if err := rec.SyncNow(); err != nil {
+	mux.HandleFunc("POST /refresh", func(w http.ResponseWriter, req *http.Request) {
+		if err := rec.RefreshNow(); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		done(w, "synced")
+		done(w, "refreshed")
+	})
+
+	mux.HandleFunc("POST /apply", func(w http.ResponseWriter, req *http.Request) {
+		if err := rec.ApplyUpstream(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		done(w, "applied updates from git")
 	})
 
 	mux.HandleFunc("POST /revert", func(w http.ResponseWriter, req *http.Request) {
@@ -101,7 +121,7 @@ func NewWebUI(rec *Reconciler) http.Handler {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		done(w, "reverted "+rel)
+		done(w, "applied git version of "+rel)
 	})
 
 	mux.HandleFunc("POST /promote", func(w http.ResponseWriter, req *http.Request) {

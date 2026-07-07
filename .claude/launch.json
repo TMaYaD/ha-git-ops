@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dashboard-preview",
+      "runtimeExecutable": "go",
+      "runtimeArgs": ["run", "./cmd/preview"],
+      "cwd": "ha-git-ops/src",
+      "port": 8098
+    }
+  ]
+}

@@ -2,71 +2,420 @@
 <html>
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>HA GitOps</title>
 <style>
- body { font-family: system-ui, sans-serif; margin: 1.5rem; max-width: 60rem; }
- .ok { color: #1a7f37; }
- .bad { color: #cf222e; }
- .warn { color: #9a6700; }
- pre { background: #f6f8fa; padding: .8rem; overflow-x: auto; font-size: .85rem; }
- .file { border: 1px solid #d0d7de; border-radius: 6px; margin: 1rem 0; }
- .file > header {
-   padding: .5rem .8rem; background: #f6f8fa;
-   display: flex; justify-content: space-between; align-items: center;
-   flex-wrap: wrap; gap: .5rem;
- }
- button { cursor: pointer; }
- input[type=text] { width: 20rem; }
+:root {
+  --bg: #f5f6f8;
+  --card: #ffffff;
+  --text: #1c2733;
+  --muted: #5b6875;
+  --border: #e3e6ea;
+  --shadow: 0 1px 3px rgba(0,0,0,.07);
+  --primary: #03a9f4;
+  --primary-text: #ffffff;
+  --primary-press: #0294d7;
+  --ok: #1e7e34;        --ok-bg: #e5f3e8;
+  --warn: #8a5b00;      --warn-bg: #fdf1d2;
+  --bad: #c62828;       --bad-bg: #fdeaea;
+  --code-bg: #f0f2f5;
+  --diff-bg: #fbfcfd;
+  --add: #1a7f37;       --add-bg: rgba(46,160,67,.12);
+  --del: #cf222e;       --del-bg: rgba(248,81,73,.12);
+  --hunk: #0550ae;
+  --inf: #0b6bb8;       --inf-bg: #e3f1fc;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111417;
+    --card: #1c2126;
+    --text: #e3e6ea;
+    --muted: #98a2ac;
+    --border: #2d353d;
+    --shadow: 0 1px 3px rgba(0,0,0,.45);
+    --primary: #29b6f6;
+    --primary-text: #0b1216;
+    --primary-press: #4fc3f7;
+    --ok: #7bc88a;      --ok-bg: rgba(76,175,80,.16);
+    --warn: #ffca6a;    --warn-bg: rgba(255,152,0,.16);
+    --bad: #f28b82;     --bad-bg: rgba(244,67,54,.16);
+    --code-bg: #14181c;
+    --diff-bg: #171c21;
+    --add: #6fdd8b;     --add-bg: rgba(63,185,80,.16);
+    --del: #ff8182;     --del-bg: rgba(248,81,73,.16);
+    --hunk: #79c0ff;
+    --inf: #6cb8f0;     --inf-bg: rgba(41,182,246,.14);
+  }
+}
+
+* { box-sizing: border-box; }
+body {
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg); color: var(--text);
+  margin: 0; line-height: 1.5;
+}
+main { max-width: 60rem; margin: 0 auto; padding: 1.25rem 1.25rem 3rem; }
+
+code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: .86em; background: var(--code-bg);
+  padding: .1em .35em; border-radius: 4px;
+}
+
+.topbar {
+  display: flex; justify-content: space-between; align-items: center;
+  gap: 1rem; flex-wrap: wrap; margin-bottom: .35rem;
+}
+.brand { display: flex; align-items: center; gap: .55rem; }
+.brand svg { color: var(--primary); flex: none; }
+.brand h1 { font-size: 1.2rem; font-weight: 650; margin: 0; letter-spacing: .01em; }
+
+.statusline {
+  display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
+  color: var(--muted); font-size: .9rem; margin: 0 0 1.25rem;
+}
+.ok, .warn, .bad {
+  display: inline-flex; align-items: center;
+  padding: .12rem .65rem; border-radius: 999px;
+  font-weight: 600; font-size: .8rem; white-space: nowrap;
+}
+.nw { white-space: nowrap; }
+.ok   { color: var(--ok);   background: var(--ok-bg); }
+.warn { color: var(--warn); background: var(--warn-bg); }
+.bad  { color: var(--bad);  background: var(--bad-bg); white-space: normal; }
+.info { color: var(--inf);  background: var(--inf-bg); }
+
+.sechead {
+  font-size: .8rem; font-weight: 650; text-transform: uppercase;
+  letter-spacing: .06em; color: var(--muted);
+  margin: 1.75rem 0 .25rem;
+}
+
+button, input[type=text] { font: inherit; font-size: .875rem; }
+button {
+  cursor: pointer; border-radius: 8px; padding: .45rem .95rem;
+  font-weight: 600; border: 1px solid var(--border);
+  background: var(--card); color: var(--text);
+  transition: background .12s, border-color .12s;
+}
+button:hover { border-color: var(--muted); }
+button.primary {
+  background: var(--primary); border-color: transparent;
+  color: var(--primary-text);
+}
+button.primary:hover { background: var(--primary-press); }
+input[type=text] {
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: .42rem .7rem; background: var(--card); color: var(--text);
+  min-width: 0;
+}
+input[type=text]::placeholder { color: var(--muted); }
+input[type=text]:focus, button:focus-visible {
+  outline: 2px solid var(--primary); outline-offset: 1px; border-color: transparent;
+}
+
+.banner {
+  display: flex; align-items: center; gap: .6rem;
+  background: var(--warn-bg); color: var(--warn);
+  border-radius: 10px; padding: .65rem 1rem;
+  font-weight: 550; font-size: .9rem; margin: 0 0 1rem;
+}
+
+.card {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 12px; box-shadow: var(--shadow);
+  margin: 1rem 0; overflow: hidden;
+}
+.card.conflicts { border-color: color-mix(in srgb, var(--bad) 35%, var(--border)); }
+.card.conflicts h3 {
+  margin: 0; padding: .7rem 1rem; font-size: .95rem;
+  color: var(--bad); background: var(--bad-bg);
+}
+.card.conflicts ul { margin: 0; padding: .6rem 1rem .8rem 2.2rem; }
+.card.conflicts li { margin: .25rem 0; }
+.card.conflicts li span { color: var(--muted); font-size: .9rem; }
+.card.conflicts p.hint {
+  margin: 0; padding: 0 1rem .8rem; color: var(--muted); font-size: .85rem;
+}
+
+.file > header {
+  display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
+  padding: .65rem 1rem;
+}
+.file > header code { font-size: .9rem; background: none; padding: 0; font-weight: 600; }
+.chip {
+  font-size: .78rem; color: var(--muted);
+  background: var(--code-bg); border-radius: 999px; padding: .1rem .6rem;
+}
+.file pre.diff {
+  margin: 0; padding: .7rem 0; background: var(--diff-bg);
+  border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+  overflow-x: auto; font-size: .8rem; line-height: 1.55;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.diff .line { display: block; padding: 0 1rem; min-height: 1.55em; width: max-content; min-width: 100%; }
+.diff .add  { color: var(--add); background: var(--add-bg); }
+.diff .del  { color: var(--del); background: var(--del-bg); }
+.diff .hunk { color: var(--hunk); }
+.diff .meta { color: var(--muted); font-weight: 600; }
+
+.top-actions { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+.seg {
+  display: inline-flex; border: 1px solid var(--border); border-radius: 8px;
+  overflow: hidden; background: var(--card);
+}
+.seg button {
+  border: none; border-radius: 0; padding: .42rem .8rem;
+  font-size: .8rem; font-weight: 600; background: transparent; color: var(--muted);
+}
+.seg button + button { border-left: 1px solid var(--border); }
+.seg button[aria-pressed="true"] { background: var(--code-bg); color: var(--text); }
+
+table.split {
+  display: none; width: 100%; table-layout: fixed; border-collapse: collapse;
+  background: var(--diff-bg);
+  border-top: 1px solid var(--border); border-bottom: 1px solid var(--border);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: .8rem; line-height: 1.55;
+}
+body.split-view table.split { display: table; }
+body.split-view pre.diff { display: none; }
+table.split td {
+  width: 50%; padding: .05rem .8rem; vertical-align: top;
+  white-space: pre-wrap; overflow-wrap: anywhere;
+}
+table.split td + td { border-left: 1px solid var(--border); }
+table.split td.add   { color: var(--add); background: var(--add-bg); }
+table.split td.del   { color: var(--del); background: var(--del-bg); }
+table.split td.blank { background: var(--code-bg); }
+table.split td.hunk  { color: var(--hunk); padding: .2rem .8rem; }
+table.split td:empty::after { content: "\00a0"; }
+
+.actions {
+  display: flex; align-items: center; gap: .6rem; flex-wrap: wrap;
+  padding: .6rem 1rem .7rem;
+}
+.actions .adopt { color: var(--muted); font-size: .85rem; font-style: italic; }
+.actions form.promote {
+  display: flex; gap: .5rem; flex: 1; min-width: 14rem;
+  justify-content: flex-end;
+}
+.actions form.promote input { flex: 1; max-width: 22rem; }
+
+.promote-all {
+  display: flex; gap: .6rem; align-items: center; flex-wrap: wrap;
+  padding: .8rem 1rem;
+}
+.promote-all input { flex: 1; min-width: 12rem; }
+
+.apply-all {
+  display: flex; gap: .6rem; align-items: center; flex-wrap: wrap;
+  justify-content: space-between; padding: .8rem 1rem;
+}
+.apply-all .hint { color: var(--muted); font-size: .85rem; }
+
+.empty {
+  text-align: center; color: var(--muted); padding: 3.5rem 1rem;
+}
+.empty .mark {
+  display: inline-flex; width: 3.2rem; height: 3.2rem;
+  align-items: center; justify-content: center;
+  border-radius: 50%; background: var(--ok-bg); color: var(--ok);
+  font-size: 1.5rem; margin-bottom: .8rem;
+}
+.empty p { margin: .2rem 0; }
+.empty .lead { color: var(--text); font-weight: 600; font-size: 1.05rem; }
+
+@media (max-width: 640px) {
+  .actions form.promote { justify-content: stretch; }
+  .actions form.promote input { max-width: none; }
+}
 </style>
 </head>
 <body>
-<h2>HA GitOps</h2>
-<p>{{.StatusHTML}}</p>
-<form method="post" action="./sync" style="display:inline"><button>Sync now</button></form>
+<main>
+
+<div class="topbar">
+  <div class="brand">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <line x1="6" y1="3" x2="6" y2="15"></line>
+      <circle cx="18" cy="6" r="3"></circle>
+      <circle cx="6" cy="18" r="3"></circle>
+      <path d="M18 9a9 9 0 0 1-9 9"></path>
+    </svg>
+    <h1>HA GitOps</h1>
+  </div>
+  <div class="top-actions">
+    {{if or .Files .Incoming}}
+    <div class="seg" role="group" aria-label="Diff view">
+      <button type="button" data-view="unified" aria-pressed="true">Unified</button>
+      <button type="button" data-view="split" aria-pressed="false">Split</button>
+    </div>
+    {{end}}
+    <form method="post" action="./refresh"><button>↻ Refresh</button></form>
+  </div>
+</div>
+
+<p class="statusline">{{.StatusHTML}}</p>
 
 {{if .RestartRequired}}
-<p class="warn">Core restart required to activate applied changes.</p>
+<div class="banner">⚠ Restart Home Assistant Core to activate the applied changes.</div>
 {{end}}
 
 {{if .Conflicts}}
-<h3>Conflicts (resolve by revert or promote, then sync)</h3>
+<div class="card conflicts">
+<h3>⚠ Conflicts</h3>
 <ul>
 {{range .Conflicts}}
-  <li><code>{{.Rel}}</code> — {{.Why}}</li>
+  <li><code>{{.Rel}}</code> <span>— {{.Why}}</span></li>
 {{end}}
 </ul>
+<p class="hint">For each file, apply the git version or promote the HA version, then refresh.</p>
+</div>
 {{end}}
 
-{{range .Files}}
-<div class="file">
+{{if .Incoming}}
+<h2 class="sechead">Incoming from git</h2>
+{{range .Incoming}}
+<div class="card file">
 <header>
- <code>{{.Rel}}</code> <span>{{.Why}}</span>
- <span>
+  <code>{{.Rel}}</code>
+  <span class="chip">{{.Why}}</span>
+</header>
+<pre class="diff">{{.Diff}}</pre>
+</div>
+{{end}}
+<div class="card">
+<form method="post" action="./apply" class="apply-all">
+<span class="hint">Writes these changes to Home Assistant — config-checked, rolled back on failure.</span>
+<button class="primary">Apply {{len .Incoming}} {{if eq (len .Incoming) 1}}file{{else}}files{{end}} to HA</button>
+</form>
+</div>
+{{end}}
+
+{{if .Files}}
+<h2 class="sechead">Changed in Home Assistant</h2>
+{{end}}
+{{range .Files}}
+<div class="card file">
+<header>
+  <code>{{.Rel}}</code>
+  <span class="chip">{{.Why}}</span>
+</header>
+<pre class="diff">{{.Diff}}</pre>
+<div class="actions">
   {{if .CanRevert}}
-  <form method="post" action="./revert" style="display:inline">
-   <input type="hidden" name="rel" value="{{.Rel}}">
-   <button>Revert to git</button>
+  <form method="post" action="./revert">
+    <input type="hidden" name="rel" value="{{.Rel}}">
+    <button>Apply git version</button>
   </form>
   {{else}}
-  <em>not in git yet — promote to adopt</em>
+  <span class="adopt">Not in git yet — promote to start tracking it.</span>
   {{end}}
-  <form method="post" action="./promote" style="display:inline">
-   <input type="hidden" name="rel" value="{{.Rel}}">
-   <input type="text" name="message" placeholder="commit message">
-   <button>Promote</button>
+  <form method="post" action="./promote" class="promote">
+    <input type="hidden" name="rel" value="{{.Rel}}">
+    <input type="text" name="message" placeholder="Commit message (optional)">
+    <button class="primary">Promote</button>
   </form>
- </span>
-</header>
-<pre>{{.Diff}}</pre>
+</div>
 </div>
 {{end}}
 
 {{if .PromoteAll}}
-<form method="post" action="./promote">
+<div class="card">
+<form method="post" action="./promote" class="promote-all">
 {{range .Files}}<input type="hidden" name="rel" value="{{.Rel}}">{{end}}
-<input type="text" name="message" placeholder="commit message">
-<button>Promote all {{len .Files}} files</button>
+<input type="text" name="message" placeholder="Commit message (optional)">
+<button class="primary">Promote all {{len .Files}} files</button>
 </form>
+</div>
 {{end}}
+
+{{if .InSync}}
+<div class="empty">
+  <span class="mark">✓</span>
+  <p class="lead">Everything is in sync</p>
+  <p>Home Assistant matches git — nothing to promote or apply.</p>
+</div>
+{{end}}
+
+</main>
+<script>
+(function () {
+  var pres = document.querySelectorAll('pre.diff');
+
+  function classify(l) {
+    if (l.startsWith('+++') || l.startsWith('---')) return 'meta';
+    if (l.startsWith('@@')) return 'hunk';
+    if (l.startsWith('+')) return 'add';
+    if (l.startsWith('-')) return 'del';
+    return '';
+  }
+
+  for (const pre of pres) {
+    var lines = pre.textContent.replace(/\n$/, '').split('\n');
+
+    // Unified view: one full-width colored row per line.
+    pre.textContent = '';
+    for (const l of lines) {
+      var span = document.createElement('span');
+      span.className = ('line ' + classify(l)).trim();
+      span.textContent = l;
+      pre.appendChild(span);
+    }
+
+    // Split view: deletions left, additions right, paired within each hunk.
+    var table = document.createElement('table');
+    table.className = 'split';
+    var dels = [], adds = [];
+    function cell(row, text, cls) {
+      var td = row.insertCell();
+      if (text === undefined) td.className = 'blank';
+      else { td.textContent = text; if (cls) td.className = cls; }
+    }
+    function flush() {
+      var n = Math.max(dels.length, adds.length);
+      for (var i = 0; i < n; i++) {
+        var r = table.insertRow();
+        cell(r, dels[i], 'del');
+        cell(r, adds[i], 'add');
+      }
+      dels = []; adds = [];
+    }
+    for (const l of lines) {
+      var c = classify(l);
+      if (c === 'meta') { flush(); continue; }  // filename is in the card header
+      if (c === 'hunk') {
+        flush();
+        var td = table.insertRow().insertCell();
+        td.colSpan = 2; td.className = 'hunk'; td.textContent = l;
+      } else if (c === 'add') adds.push(l.slice(1));
+      else if (c === 'del') dels.push(l.slice(1));
+      else { flush(); var t = l.slice(1); var r = table.insertRow(); cell(r, t, ''); cell(r, t, ''); }
+    }
+    flush();
+    pre.after(table);
+  }
+
+  var seg = document.querySelector('.seg');
+  if (seg && pres.length) {
+    function setView(v) {
+      document.body.classList.toggle('split-view', v === 'split');
+      seg.querySelectorAll('button').forEach(function (b) {
+        b.setAttribute('aria-pressed', String(b.dataset.view === v));
+      });
+      try { localStorage.setItem('diffview', v); } catch (e) {}
+    }
+    seg.addEventListener('click', function (e) {
+      var b = e.target.closest('button[data-view]');
+      if (b) setView(b.dataset.view);
+    });
+    var v = 'unified';
+    try { v = localStorage.getItem('diffview') || 'unified'; } catch (e) {}
+    setView(v);
+  }
+})();
+</script>
 </body>
 </html>

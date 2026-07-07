@@ -4,10 +4,11 @@
 
 ArgoCD-style GitOps for Home Assistant OS.
 
-Git is desired state. The HA instance is live state. This add-on applies
-new commits to `/config`, continuously surfaces drift (click-ops changes),
-and lets a human decide per file: **revert** to git, or **promote** to git.
-It never auto-commits.
+Git is desired state. The HA instance is live state. This add-on
+continuously surfaces both incoming commits and drift (click-ops changes)
+as reviewable diffs, and lets a human decide: **apply** the git version,
+or **promote** the HA version to git. It never writes in either direction
+on its own.
 
 Secrets are SOPS + age encrypted at value level (`secrets.sops.yaml` in
 git ⇄ plaintext `secrets.yaml` on the instance). The add-on generates its

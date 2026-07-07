@@ -2,15 +2,19 @@ package main
 
 // Reconciler state machine per managed file:
 //
-//	in-sync    live == HEAD
-//	drift      live != HEAD and HEAD did not move (click-ops change)
+//	in-sync    live == applied HEAD
+//	drift      live != applied HEAD and HEAD did not move (click-ops change)
+//	incoming   remote HEAD moved past the applied baseline; the change is
+//	           surfaced with a diff and written only on explicit apply
 //	conflict   HEAD moved AND live != previously-applied version
 //	           (both sides changed; never auto-resolved)
 //
-// Apply only writes files whose live content still matches the previously
-// applied git version — local edits are never stomped. On first run
-// nothing is written: remote HEAD becomes the baseline and every
-// difference shows up as drift for the human to promote or revert.
+// Nothing is ever written sight unseen: the poll loop only fetches and
+// recomputes diffs. Apply only writes files whose live content still
+// matches the previously applied git version — local edits are never
+// stomped. On first run nothing is written: remote HEAD becomes the
+// baseline and every difference shows up as drift for the human to
+// promote or apply.
 
 import (
 	"bytes"
@@ -45,7 +49,9 @@ var reloadServices = map[string][2]string{
 
 type Status struct {
 	Drift           map[string]string
+	Incoming        map[string]string
 	Conflicts       map[string]string
+	PendingSHA      string
 	Error           string
 	RestartRequired bool
 	LastSync        string
@@ -86,6 +92,7 @@ func NewReconciler(opts Options, ha *HA) *Reconciler {
 		backupsDir: "/data/backups",
 		status: Status{
 			Drift:     map[string]string{},
+			Incoming:  map[string]string{},
 			Conflicts: map[string]string{},
 		},
 	}
@@ -101,6 +108,7 @@ func (r *Reconciler) Snapshot() (Status, string) {
 	defer r.mu.Unlock()
 	st := r.status
 	st.Drift = copyMap(r.status.Drift)
+	st.Incoming = copyMap(r.status.Incoming)
 	st.Conflicts = copyMap(r.status.Conflicts)
 	return st, r.state.AppliedSHA
 }
@@ -329,13 +337,16 @@ func (r *Reconciler) writeLive(rel string, content []byte) error {
 
 // ---------- reconcile ----------
 
+// Tick fetches upstream and recomputes incoming changes and drift. It
+// never writes to live HA — upstream commits wait as reviewable
+// incoming changes until an explicit ApplyUpstream.
 func (r *Reconciler) Tick() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.tickLocked()
+	return r.refreshLocked()
 }
 
-func (r *Reconciler) tickLocked() error {
+func (r *Reconciler) refreshLocked() error {
 	if err := r.ensureRepo(); err != nil {
 		return err
 	}
@@ -348,8 +359,7 @@ func (r *Reconciler) tickLocked() error {
 	}
 	remote = strings.TrimSpace(remote)
 
-	switch {
-	case r.state.AppliedSHA == "":
+	if r.state.AppliedSHA == "" {
 		// First run: baseline only, write nothing. Differences appear as
 		// drift for the human to converge deliberately.
 		if _, err := r.git("reset", "--hard", remote); err != nil {
@@ -360,12 +370,25 @@ func (r *Reconciler) tickLocked() error {
 			return err
 		}
 		log.Printf("baselined at %.9s without applying (first run)", remote)
-	case remote != r.state.AppliedSHA:
-		if err := r.apply(r.state.AppliedSHA, remote); err != nil {
-			return err
-		}
 	}
 
+	if err := r.computeIncoming(remote); err != nil {
+		return err
+	}
+	if len(r.status.Incoming) == 0 && remote != r.state.AppliedSHA {
+		// Upstream moved but nothing user-visible would change (e.g. a
+		// sops re-encryption to the same plaintext, or commits already
+		// matching live): fast-forward the baseline without touching HA.
+		if _, err := r.git("reset", "--hard", remote); err != nil {
+			return err
+		}
+		r.state.AppliedSHA = remote
+		if err := r.saveState(); err != nil {
+			return err
+		}
+		r.status.PendingSHA = ""
+		log.Printf("fast-forwarded baseline to %.9s (no live changes)", remote)
+	}
 	if err := r.computeDrift(); err != nil {
 		return err
 	}
@@ -373,6 +396,41 @@ func (r *Reconciler) tickLocked() error {
 	r.notifyDrift()
 	r.status.Error = ""
 	r.status.LastSync = time.Now().Format("2006-01-02 15:04:05")
+	return nil
+}
+
+// computeIncoming diffs applied..remote into reviewable pending changes.
+// Nothing is written; the classification mirrors what apply would do.
+func (r *Reconciler) computeIncoming(remote string) error {
+	incoming := map[string]string{}
+	r.status.PendingSHA = ""
+	if remote != r.state.AppliedSHA {
+		rels, err := r.changedRels(r.state.AppliedSHA, remote)
+		if err != nil {
+			return err
+		}
+		for _, rel := range rels {
+			was := r.atRef(r.state.AppliedSHA, rel)
+			want := r.atRef(remote, rel)
+			liveB := r.live(rel)
+			switch {
+			case want == nil && liveB == nil:
+				// gone on both sides — nothing to apply
+			case liveB != nil && want != nil && bytes.Equal(liveB, want):
+				// live already matches the new version — nothing to apply
+			case liveB != nil && was != nil && !bytes.Equal(liveB, was):
+				incoming[rel] = "changed in both git and HA — apply will skip it"
+			case want == nil:
+				incoming[rel] = "deleted in git"
+			case was == nil:
+				incoming[rel] = "new in git"
+			default:
+				incoming[rel] = "updated in git"
+			}
+		}
+		r.status.PendingSHA = remote
+	}
+	r.status.Incoming = incoming
 	return nil
 }
 
@@ -418,7 +476,7 @@ func (r *Reconciler) apply(old, new_ string) error {
 		liveB := r.live(rel)
 		was := r.atRef(old, rel)
 		if liveB != nil && was != nil && !bytes.Equal(liveB, was) {
-			conflicts[rel] = "changed in git and live"
+			conflicts[rel] = "changed in both git and HA"
 			continue
 		}
 		want := r.atRef(new_, rel)
@@ -449,7 +507,7 @@ func (r *Reconciler) apply(old, new_ string) error {
 	if len(conflicts) > 0 {
 		keys := sortedKeys(conflicts)
 		r.ha.Notify("GitOps conflict",
-			"Changed in both git and live, not applied: "+strings.Join(keys, ", "))
+			"Changed in both git and HA, not applied: "+strings.Join(keys, ", "))
 	} else {
 		r.ha.Dismiss("GitOps conflict")
 	}
@@ -551,11 +609,11 @@ func (r *Reconciler) computeDrift() error {
 			// registered dashboard with no config yet, or vanished both
 			// sides — nothing to reconcile
 		case want == nil:
-			drift[rel] = "live only (promote to adopt)"
+			drift[rel] = "only in HA"
 		case liveB == nil:
-			drift[rel] = "missing live"
+			drift[rel] = "missing in HA"
 		case !bytes.Equal(liveB, want):
-			drift[rel] = "modified live"
+			drift[rel] = "modified in HA"
 		}
 	}
 	r.status.Drift = drift
@@ -563,7 +621,7 @@ func (r *Reconciler) computeDrift() error {
 }
 
 func (r *Reconciler) publish() {
-	n := len(r.status.Drift) + len(r.status.Conflicts)
+	n := len(r.status.Drift) + len(r.status.Incoming) + len(r.status.Conflicts)
 	sha := r.state.AppliedSHA
 	if len(sha) > 9 {
 		sha = sha[:9]
@@ -572,6 +630,7 @@ func (r *Reconciler) publish() {
 		"friendly_name":    "GitOps drift",
 		"icon":             "mdi:source-branch-sync",
 		"drift":            sortedKeys(r.status.Drift),
+		"incoming":         sortedKeys(r.status.Incoming),
 		"conflicts":        sortedKeys(r.status.Conflicts),
 		"applied_sha":      sha,
 		"restart_required": r.status.RestartRequired,
@@ -581,11 +640,13 @@ func (r *Reconciler) publish() {
 const driftNotifyTitle = "GitOps: drift detected"
 
 // notifyDrift maintains one persistent notification listing every file
-// that needs a human decision (drift and conflicts). It only touches HA
-// when the set changes: new files push through notify_service too, a
-// shrinking set refreshes the notification silently, and an empty set
-// dismisses it. In-memory tracking means an add-on restart re-notifies
-// once, which doubles as a reminder.
+// that needs a human decision (drift, incoming, and conflicts). It only
+// touches HA when the set changes: new files push through
+// notify_service too, a shrinking set refreshes the notification
+// silently, and an empty set dismisses it. In-memory tracking means an
+// add-on restart re-notifies once, which doubles as a reminder.
+// Incoming is excluded under auto_apply — those files resolve on their
+// own moments later and would only generate push noise.
 func (r *Reconciler) notifyDrift() {
 	if !r.opts.NotifyDrift {
 		return
@@ -593,6 +654,11 @@ func (r *Reconciler) notifyDrift() {
 	current := map[string]string{}
 	for rel, reason := range r.status.Drift {
 		current[rel] = reason
+	}
+	if !r.opts.AutoApply {
+		for rel, reason := range r.status.Incoming {
+			current[rel] = reason
+		}
 	}
 	for rel, reason := range r.status.Conflicts {
 		current[rel] = "conflict: " + reason
@@ -616,11 +682,11 @@ func (r *Reconciler) notifyDrift() {
 	}
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "%d file(s) differ between git and live:\n", len(current))
+	fmt.Fprintf(&b, "%d file(s) differ between git and HA:\n", len(current))
 	for _, rel := range sortedKeys(current) {
 		fmt.Fprintf(&b, "- %s — %s\n", rel, current[rel])
 	}
-	b.WriteString("\nOpen the GitOps panel to promote or revert.")
+	b.WriteString("\nOpen the GitOps panel to apply or promote.")
 	if hasNew {
 		r.ha.Notify(driftNotifyTitle, b.String())
 	} else {
@@ -643,7 +709,44 @@ func sortedKeys(m map[string]string) []string {
 
 // ---------- human actions (from the web UI) ----------
 
-func (r *Reconciler) SyncNow() error { return r.Tick() }
+func (r *Reconciler) RefreshNow() error { return r.Tick() }
+
+// ApplyUpstream writes the pending upstream changes (applied..remote)
+// into live HA: sops-decrypted, config-checked (rolled back on failure),
+// then activated. Files changed on both sides become conflicts and are
+// never overwritten.
+func (r *Reconciler) ApplyUpstream() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err := r.ensureRepo(); err != nil {
+		return err
+	}
+	if _, err := r.git("fetch", "origin", r.opts.Branch); err != nil {
+		return err
+	}
+	remote, err := r.git("rev-parse", "origin/"+r.opts.Branch)
+	if err != nil {
+		return err
+	}
+	remote = strings.TrimSpace(remote)
+	if remote != r.state.AppliedSHA {
+		if err := r.apply(r.state.AppliedSHA, remote); err != nil {
+			return err
+		}
+	}
+	// apply may have kept the baseline (config-check rollback) — recompute
+	// so incoming reflects what is still pending rather than going stale.
+	if err := r.computeIncoming(remote); err != nil {
+		return err
+	}
+	if err := r.computeDrift(); err != nil {
+		return err
+	}
+	r.publish()
+	r.notifyDrift()
+	r.status.LastSync = time.Now().Format("2006-01-02 15:04:05")
+	return nil
+}
 
 // CanRevert reports whether reverting rel is a supported operation.
 // A "live only" dashboard or registry has nothing in git to revert to —
@@ -757,8 +860,9 @@ func (r *Reconciler) Promote(rels []string, message string) error {
 	return nil
 }
 
-// DiffText renders a unified diff of git (desired) vs live for the UI.
-// Secrets are masked to avoid leaking values into the panel.
+// DiffText renders a unified diff of git (applied) vs live for the UI —
+// additions are the HA-side edits. Secrets are masked to avoid leaking
+// values into the panel.
 func (r *Reconciler) DiffText(rel string) string {
 	if rel == secretsPlain {
 		return "(secrets diff masked — values changed)"
@@ -766,7 +870,25 @@ func (r *Reconciler) DiffText(rel string) string {
 	r.mu.Lock()
 	head := r.state.AppliedSHA
 	r.mu.Unlock()
+	return diffText(r.atRef(head, rel), "git/", r.live(rel), "live/")
+}
 
+// IncomingDiffText renders what applying the pending upstream changes
+// would do to live HA — additions are git's incoming content.
+func (r *Reconciler) IncomingDiffText(rel string) string {
+	if rel == secretsPlain {
+		return "(secrets diff masked — values changed)"
+	}
+	r.mu.Lock()
+	pending := r.status.PendingSHA
+	r.mu.Unlock()
+	if pending == "" {
+		return ""
+	}
+	return diffText(r.live(rel), "live/", r.atRef(pending, rel), "git/")
+}
+
+func diffText(from []byte, fromPrefix string, to []byte, toPrefix string) string {
 	tmpFile := func(prefix string, content []byte) (string, error) {
 		if content == nil {
 			return os.DevNull, nil
@@ -782,23 +904,23 @@ func (r *Reconciler) DiffText(rel string) string {
 		}
 		return tmp.Name(), nil
 	}
-	wantPath, err := tmpFile("desired-*", r.atRef(head, rel))
+	fromPath, err := tmpFile("from-*", from)
 	if err != nil {
 		return err.Error()
 	}
-	if wantPath != os.DevNull {
-		defer os.Remove(wantPath)
+	if fromPath != os.DevNull {
+		defer os.Remove(fromPath)
 	}
-	livePath, err := tmpFile("live-*", r.live(rel))
+	toPath, err := tmpFile("to-*", to)
 	if err != nil {
 		return err.Error()
 	}
-	if livePath != os.DevNull {
-		defer os.Remove(livePath)
+	if toPath != os.DevNull {
+		defer os.Remove(toPath)
 	}
 	// git diff --no-index exits 1 when files differ; that's expected.
 	cmd := exec.Command("git", "diff", "--no-index",
-		"--src-prefix=git/", "--dst-prefix=live/", wantPath, livePath)
+		"--src-prefix="+fromPrefix, "--dst-prefix="+toPrefix, fromPath, toPath)
 	out, _ := cmd.Output()
 	return string(out)
 }

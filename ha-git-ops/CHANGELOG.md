@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.5.0
+
+- **Upstream commits are no longer applied sight unseen.** The poll loop
+  is now read-only (fetch + diff): new commits surface in the panel as
+  an "Incoming from git" section with per-file diffs of exactly what
+  applying would change live, including a warning on files that apply
+  would skip as conflicts. A single "Apply N files to HA" button writes
+  the pending range — same config check, rollback, and never-stomp-
+  local-edits guarantees as before. Commits that would change nothing
+  live fast-forward the baseline silently.
+- New options, ArgoCD semantics: `auto_refresh` (default `true`) —
+  background fetch + diff; `auto_apply` (default `false`, ArgoCD's
+  `syncPolicy.automated`) — apply incoming changes after each background
+  refresh.
+- `sensor.ha_gitops_drift` now counts drift + incoming + conflicts and
+  exposes an `incoming` file-list attribute. The 0.4.0 drift
+  notification also lists incoming files (except under `auto_apply`,
+  where they resolve on their own and would only be push noise).
+- Panel redesign: HA-native cards and palette, dark mode via
+  `prefers-color-scheme`, diff syntax coloring, optional side-by-side
+  (split) diff view persisted per browser, responsive layout, and an
+  in-sync empty state.
+- Copy pass — one verb per action, direction always explicit:
+  "Apply git version" (was "Revert to git"), "Promote", "↻ Refresh"
+  (was "Sync now"), drift chips "modified in HA" / "missing in HA" /
+  "only in HA".
+- Dev: `cmd/preview` renders the panel with fixture states
+  (`go run ./cmd/preview`) for design iteration without a live stack.
+
 ## 0.4.0
 
 - Drift notifications: a persistent notification now lists every file
