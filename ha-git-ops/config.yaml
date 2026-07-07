@@ -1,5 +1,5 @@
 name: HA GitOps
-version: 0.3.1
+version: 0.4.0
 slug: ha_git_ops
 description: ArgoCD-style GitOps reconciler — git is desired state, drift is surfaced for human promote/revert
 url: https://github.com/TMaYaD/ha-git-ops
@@ -24,6 +24,8 @@ options:
   auto_restart_core: false
   commit_name: ha-git-ops
   commit_email: ha-git-ops@homelab.local
+  notify_drift: true
+  notify_service: ""
 schema:
   repo_url: str
   branch: str
@@ -32,3 +34,5 @@ schema:
   auto_restart_core: bool
   commit_name: str
   commit_email: str
+  notify_drift: bool
+  notify_service: str
