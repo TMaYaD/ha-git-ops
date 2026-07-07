@@ -6,6 +6,8 @@
    - `repo_url` — ssh clone URL, e.g. `git@github.com:you/homelab.git`
    - `subfolder` — repo path that mirrors `/config`, e.g. `home-assistant/config`
    - `branch`, `poll_interval`, `auto_restart_core` as you like
+   - `notify_drift`, `notify_service` — drift/conflict notifications
+     and optional push routing (see Behavior below)
 2. Start it once. The log prints two public keys:
    - the **ssh deploy key** — add it to the git host with **write** access
      (write is needed for promote)
@@ -28,6 +30,12 @@
 - Live (click-ops) changes are **never** committed automatically. The
   panel shows the diff; *promote* commits it to the branch with your
   message, *revert* restores the git version.
+- Drift is announced, not just displayed: a persistent notification
+  lists every file awaiting a decision, updates as the set changes, and
+  dismisses itself once you're back in sync (`notify_drift: false`
+  turns this off). Set `notify_service` to a notify service (e.g.
+  `notify.mobile_app_your_phone`) and every GitOps alert — new drift,
+  conflicts, rollbacks, restart required — is also pushed through it.
 - `sensor.ha_gitops_drift` exposes the drift count with file lists as
   attributes — automate reminders off it if you like.
 - The secrets file is special-cased: git holds `secrets.sops.yaml`

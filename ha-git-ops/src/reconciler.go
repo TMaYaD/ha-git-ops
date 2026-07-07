@@ -68,9 +68,10 @@ type Reconciler struct {
 	AgePub string
 	SSHPub string
 
-	mu     sync.Mutex
-	state  persistedState
-	status Status
+	mu       sync.Mutex
+	state    persistedState
+	status   Status
+	notified map[string]bool // rels covered by the current drift notification
 }
 
 func NewReconciler(opts Options, ha *HA) *Reconciler {
@@ -369,6 +370,7 @@ func (r *Reconciler) tickLocked() error {
 		return err
 	}
 	r.publish()
+	r.notifyDrift()
 	r.status.Error = ""
 	r.status.LastSync = time.Now().Format("2006-01-02 15:04:05")
 	return nil
@@ -448,6 +450,8 @@ func (r *Reconciler) apply(old, new_ string) error {
 		keys := sortedKeys(conflicts)
 		r.ha.Notify("GitOps conflict",
 			"Changed in both git and live, not applied: "+strings.Join(keys, ", "))
+	} else {
+		r.ha.Dismiss("GitOps conflict")
 	}
 
 	if len(applied) > 0 {
@@ -574,6 +578,60 @@ func (r *Reconciler) publish() {
 	})
 }
 
+const driftNotifyTitle = "GitOps: drift detected"
+
+// notifyDrift maintains one persistent notification listing every file
+// that needs a human decision (drift and conflicts). It only touches HA
+// when the set changes: new files push through notify_service too, a
+// shrinking set refreshes the notification silently, and an empty set
+// dismisses it. In-memory tracking means an add-on restart re-notifies
+// once, which doubles as a reminder.
+func (r *Reconciler) notifyDrift() {
+	if !r.opts.NotifyDrift {
+		return
+	}
+	current := map[string]string{}
+	for rel, reason := range r.status.Drift {
+		current[rel] = reason
+	}
+	for rel, reason := range r.status.Conflicts {
+		current[rel] = "conflict: " + reason
+	}
+
+	if len(current) == 0 {
+		if len(r.notified) > 0 {
+			r.ha.Dismiss(driftNotifyTitle)
+			r.notified = nil
+		}
+		return
+	}
+	hasNew := false
+	for rel := range current {
+		if !r.notified[rel] {
+			hasNew = true
+		}
+	}
+	if !hasNew && len(current) == len(r.notified) {
+		return // same set as already notified
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d file(s) differ between git and live:\n", len(current))
+	for _, rel := range sortedKeys(current) {
+		fmt.Fprintf(&b, "- %s — %s\n", rel, current[rel])
+	}
+	b.WriteString("\nOpen the GitOps panel to promote or revert.")
+	if hasNew {
+		r.ha.Notify(driftNotifyTitle, b.String())
+	} else {
+		r.ha.Persist(driftNotifyTitle, b.String())
+	}
+	r.notified = map[string]bool{}
+	for rel := range current {
+		r.notified[rel] = true
+	}
+}
+
 func sortedKeys(m map[string]string) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -612,6 +670,7 @@ func (r *Reconciler) Revert(rel string) error {
 		return err
 	}
 	r.publish()
+	r.notifyDrift()
 	return nil
 }
 
@@ -694,6 +753,7 @@ func (r *Reconciler) Promote(rels []string, message string) error {
 		return err
 	}
 	r.publish()
+	r.notifyDrift()
 	return nil
 }
 

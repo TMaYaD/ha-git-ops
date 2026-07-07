@@ -19,6 +19,11 @@ const supervisor = "http://supervisor"
 type HA struct {
 	token  string
 	client *http.Client
+
+	// NotifyService is an optional "domain.service" (e.g.
+	// "notify.mobile_app_phone") that Notify additionally pushes
+	// through; empty means persistent notifications only.
+	NotifyService string
 }
 
 func NewHA() *HA {
@@ -110,12 +115,35 @@ func (h *HA) SetState(entityID, state string, attributes map[string]any) {
 	}
 }
 
-func (h *HA) Notify(title, message string) {
+// Persist creates or replaces the persistent notification keyed by title.
+func (h *HA) Persist(title, message string) {
 	h.CallService("persistent_notification", "create", map[string]any{
 		"title":           title,
 		"message":         message,
 		"notification_id": "ha_gitops_" + sanitizeID(title),
 	})
+}
+
+// Dismiss removes the persistent notification keyed by title.
+func (h *HA) Dismiss(title string) {
+	h.CallService("persistent_notification", "dismiss", map[string]any{
+		"notification_id": "ha_gitops_" + sanitizeID(title),
+	})
+}
+
+// Notify persists in the UI and, when a notify service is configured,
+// pushes through it as well so alerts reach a phone.
+func (h *HA) Notify(title, message string) {
+	h.Persist(title, message)
+	if h.NotifyService == "" {
+		return
+	}
+	domain, service, ok := strings.Cut(h.NotifyService, ".")
+	if !ok {
+		log.Printf("notify_service %q is not domain.service; skipping push", h.NotifyService)
+		return
+	}
+	h.CallService(domain, service, map[string]any{"title": title, "message": message})
 }
 
 func sanitizeID(s string) string {

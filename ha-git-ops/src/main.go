@@ -19,6 +19,8 @@ type Options struct {
 	AutoRestartCore bool   `json:"auto_restart_core"`
 	CommitName      string `json:"commit_name"`
 	CommitEmail     string `json:"commit_email"`
+	NotifyDrift     bool   `json:"notify_drift"`
+	NotifyService   string `json:"notify_service"`
 }
 
 func main() {
@@ -35,6 +37,7 @@ func main() {
 	}
 
 	ha := NewHA()
+	ha.NotifyService = opts.NotifyService
 	rec := NewReconciler(opts, ha)
 	if err := rec.EnsureKeys(); err != nil {
 		log.Fatalf("key setup: %v", err)

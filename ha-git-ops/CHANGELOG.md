@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0
+
+- Drift notifications: a persistent notification now lists every file
+  awaiting a human decision (drift and conflicts), updates when the set
+  changes, and dismisses itself once back in sync. On by default;
+  `notify_drift: false` turns it off.
+- New `notify_service` option (e.g. `notify.mobile_app_phone`): every
+  GitOps alert — new drift, conflicts, apply rollbacks, restart
+  required — is additionally pushed through that service, so it reaches
+  a phone instead of waiting in the panel.
+- The "GitOps conflict" persistent notification is dismissed by the
+  next conflict-free apply instead of lingering forever.
+
 ## 0.3.1
 
 - Hide the Revert button on "live only" dashboard/registry drift — there
