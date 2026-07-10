@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.1
+
+- Prebuilt images: GitHub Actions builds per-arch images on each GitHub
+  release and publishes them to `ghcr.io/tmayad/{arch}-ha-git-ops`.
+  Installing or updating the add-on now pulls the image instead of
+  compiling Go on the device.
+
 ## 0.5.0
 
 - **Upstream commits are no longer applied sight unseen.** The poll loop

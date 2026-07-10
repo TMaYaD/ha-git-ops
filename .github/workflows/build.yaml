@@ -1,0 +1,60 @@
+name: Build add-on
+
+# Publishes prebuilt per-arch images to GHCR so the Supervisor pulls
+# instead of compiling on-device. Release flow: bump version in
+# config.yaml + CHANGELOG, push, publish a GitHub release — this
+# workflow builds and pushes ghcr.io/tmayad/{arch}-ha-git-ops:<version>
+# (version read from config.yaml by home-assistant/builder).
+# Pull requests get a test build that is not pushed.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "ha-git-ops/**"
+      - ".github/workflows/build.yaml"
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ha-git-ops/src/go.mod
+      - run: go vet ./... && go test ./...
+        working-directory: ha-git-ops/src
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [aarch64, amd64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build ${{ matrix.arch }} add-on image
+        uses: home-assistant/builder@2024.03.5
+        with:
+          args: |
+            --${{ matrix.arch }} \
+            --target /data/ha-git-ops \
+            --image "{arch}-ha-git-ops" \
+            --docker-hub "ghcr.io/tmayad" \
+            --addon \
+            ${{ github.event_name == 'pull_request' && '--test' || '' }}
