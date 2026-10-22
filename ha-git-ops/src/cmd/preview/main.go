@@ -39,7 +39,7 @@ type apiFile struct {
 type apiState struct {
 	Branch          string    `json:"branch"`
 	AppliedSHA      string    `json:"appliedSha"`
-	AheadBaselines  int       `json:"aheadBaselines"`
+	MovedBaselines  int       `json:"movedBaselines"`
 	TargetSHA       string    `json:"targetSha"`
 	Error           string    `json:"error"`
 	RestartRequired bool      `json:"restartRequired"`

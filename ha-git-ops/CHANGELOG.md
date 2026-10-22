@@ -7,20 +7,23 @@
   `/data/repo` was reused as-is: it kept fetching from the old origin
   with the old sparse checkout, and the old baseline was diffed against
   the new paths, so a moved config showed every file as deleted on one
-  side and added on the other. On start the add-on now replaces a clone
-  that tracks a different repo or subfolder, after snapshotting each
-  file's last-applied content (raw from git, so `secrets.sops.yaml`
-  stays encrypted) to `/data/baseline`. The snapshot stands in as
-  last-applied until each file converges on the new target and is
-  deleted once all have — so after a move the panel still shows whether
-  git or HA changed a file, and a file new in the target reads as new
-  there. A persistent notification says the target changed.
-- A branch-only change keeps the baseline as is; a clone that is merely
-  missing is re-cloned without touching it. Only when the applied commit
-  is unreachable with nothing to carry over does the add-on baseline
-  afresh at the new head (writing nothing, with a notification).
-- The target the baseline belongs to is recorded in `state.json`; state
-  from earlier versions is carried over when its clone was stale.
+  side and added on the other. The clone is now replaced whenever it
+  tracks a different repo or subfolder.
+- **Last-applied is stored when applied.** Each file's last-applied is
+  now a copy of its git content (raw, so `secrets.sops.yaml` stays
+  encrypted) kept in `/data/baseline`, taken whenever the file converges
+  — on the first baseline, after an apply or commit, or when live and git
+  end up matching. It no longer depends on the old commit still being
+  reachable, so it survives a move to another repo, branch or folder even
+  when the old repo has been renamed or deleted. After a move each file
+  keeps the previous target's last-applied until it converges on the new
+  one, so the panel still shows which side changed it; the old copy is
+  removed once nothing refers to it. A persistent notification says the
+  target changed.
+- 0.6.0 state, which recorded only commits, is migrated into the store
+  from whichever clone is on disk — before a stale one is replaced. If
+  those commits are gone, the add-on baselines afresh at the current head
+  (writing nothing, with a notification).
 - A leading or trailing `/` in `subfolder` is ignored instead of
   breaking every git lookup.
 
