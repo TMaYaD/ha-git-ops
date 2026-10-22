@@ -40,7 +40,8 @@ type apiFile struct {
 }
 
 type apiState struct {
-	Branch          string    `json:"branch"`
+	Branch          string    `json:"branch"`       // tracked
+	TargetBranch    string    `json:"targetBranch"` // shown as target: tracked, or one switched to
 	CommitBranch    string    `json:"commitBranch"` // default for the panel's branch field
 	AppliedSHA      string    `json:"appliedSha"`
 	MovedBaselines  int       `json:"movedBaselines"`
@@ -71,7 +72,7 @@ func NewWebUI(rec *Reconciler, branch string) http.Handler {
 	state := func() apiState {
 		st, applied, moved := rec.Snapshot()
 		out := apiState{
-			Branch: branch, CommitBranch: rec.CommitBranch(), AppliedSHA: applied, MovedBaselines: moved,
+			Branch: branch, TargetBranch: st.Branch, CommitBranch: rec.CommitBranch(), AppliedSHA: applied, MovedBaselines: moved,
 			TargetSHA: st.TargetSHA, Error: st.Error,
 			RestartRequired: st.RestartRequired, LastSync: st.LastSync,
 			Files: []apiFile{},
@@ -143,6 +144,29 @@ func NewWebUI(rec *Reconciler, branch string) http.Handler {
 		}
 		writeJSON(w, http.StatusOK, state())
 	})
+	mux.HandleFunc("GET /api/branches", func(w http.ResponseWriter, req *http.Request) {
+		bs, err := rec.Branches()
+		if err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"branches": bs})
+	})
+	mux.HandleFunc("POST /api/view", func(w http.ResponseWriter, req *http.Request) {
+		var body struct {
+			Branch string `json:"branch"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if err := rec.View(body.Branch); err != nil {
+			log.Printf("switch target to %q failed: %v", body.Branch, err)
+			fail(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, state())
+	})
 	mux.HandleFunc("POST /api/apply", func(w http.ResponseWriter, req *http.Request) {
 		_, picks, err := decode(req)
 		if err != nil {
@@ -169,7 +193,13 @@ func NewWebUI(rec *Reconciler, branch string) http.Handler {
 		}
 		writeJSON(w, http.StatusOK, state())
 	})
-	return mux
+	// Any panel request keeps a switched target alive.
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if strings.HasPrefix(req.URL.Path, "/api/") {
+			rec.Seen()
+		}
+		mux.ServeHTTP(w, req)
+	})
 }
 
 // maskRows replaces each secret value with a short keyed hash, keeping
