@@ -230,15 +230,42 @@ func (r *Reconciler) gitEnv() []string {
 }
 
 func (r *Reconciler) git(args ...string) (string, error) {
-	cmd := exec.Command("git", append([]string{"-C", r.repoDir}, args...)...)
+	return r.gitIn(r.repoDir, args...)
+}
+
+// gitIn runs git in dir; a clone runs in dir's parent.
+func (r *Reconciler) gitIn(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	if args[0] == "clone" {
+		cmd = exec.Command("git", args...)
+	}
 	cmd.Env = r.gitEnv()
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
 	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("git %s: %s", strings.Join(args, " "),
-			strings.TrimSpace(errb.String()))
+		msg := strings.TrimSpace(errb.String())
+		return "", fmt.Errorf("git %s: %s%s", args[0], msg, r.accessHint(msg))
 	}
 	return out.String(), nil
+}
+
+// accessHint explains git host errors that mean the deploy key can't
+// reach the repo. Over SSH, GitHub answers "Repository not found" when the
+// key is valid but is a deploy key for a different repository — deploy
+// keys belong to exactly one, so moving the config to another repo needs
+// the key moved too.
+func (r *Reconciler) accessHint(msg string) string {
+	if !strings.Contains(msg, "Repository not found") &&
+		!strings.Contains(msg, "Permission denied (publickey)") &&
+		!strings.Contains(msg, "Could not read from remote repository") {
+		return ""
+	}
+	hint := " — check repo_url, and that the add-on's ssh deploy key is added to " +
+		"that repository with write access (a deploy key belongs to one repository only"
+	if r.SSHPub != "" {
+		hint += "; the key is " + r.SSHPub
+	}
+	return hint + ")"
 }
 
 // ensureRepo makes /data/repo a clone of the configured repo with the
@@ -270,23 +297,28 @@ func (r *Reconciler) ensureRepo() error {
 		}
 		log.Printf("clone at %s tracks %s:%s; re-cloning for %s:%s",
 			r.repoDir, url, sparse, r.opts.RepoURL, r.opts.Subfolder)
-		if err := os.RemoveAll(r.repoDir); err != nil {
-			return err
-		}
 	}
-	cmd := exec.Command("git", "clone", "--filter=blob:none", "--no-checkout",
-		"--branch", r.opts.Branch, r.opts.RepoURL, r.repoDir)
-	cmd.Env = r.gitEnv()
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git clone: %v: %s", err, out)
+	// Clone beside the old one and swap only once it fully worked, so a
+	// wrong repo_url or missing access leaves the working clone in place.
+	fresh := r.repoDir + ".new"
+	if err := os.RemoveAll(fresh); err != nil {
+		return err
 	}
 	for _, args := range [][]string{
+		{"clone", "--filter=blob:none", "--no-checkout", "--branch", r.opts.Branch, r.opts.RepoURL, fresh},
 		{"sparse-checkout", "set", r.opts.Subfolder},
 		{"checkout", r.opts.Branch},
 	} {
-		if _, err := r.git(args...); err != nil {
+		if _, err := r.gitIn(fresh, args...); err != nil {
+			_ = os.RemoveAll(fresh)
 			return err
 		}
+	}
+	if err := os.RemoveAll(r.repoDir); err != nil {
+		return err
+	}
+	if err := os.Rename(fresh, r.repoDir); err != nil {
+		return err
 	}
 	if !exists {
 		// 0.6.0 state with its clone gone: the same target re-cloned still

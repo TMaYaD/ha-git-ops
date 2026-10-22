@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.2
+
+- **Re-cloning no longer risks the working clone.** When `repo_url` or
+  `subfolder` changes, the new clone is made beside the old one and
+  swapped in only once it succeeds. A wrong URL or missing access now
+  leaves the existing clone and last-applied untouched until the options
+  are fixed.
+- **Access errors say what to do.** When the git host refuses the add-on
+  (GitHub answers "Repository not found" when the key is a deploy key for
+  a *different* repository), the error now points at `repo_url` and the
+  deploy key and includes the add-on's public key. Deploy keys belong to
+  one repository, so moving the config to another repo means moving the
+  key too.
+
 ## 0.6.1
 
 - **Changing `repo_url`, `branch` or `subfolder` now takes effect —

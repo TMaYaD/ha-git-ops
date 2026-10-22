@@ -426,3 +426,38 @@ func TestStaleCloneReplaced(t *testing.T) {
 		t.Fatalf("want a fresh clone of ha2, got files=%v", g.r.status.Files)
 	}
 }
+
+// A re-clone that fails (wrong repo_url, no access) leaves the working
+// clone and state as they were, and picks up once the options are fixed.
+func TestFailedRecloneKeepsOldClone(t *testing.T) {
+	g := newRig(t)
+	g.tick()
+	before, _ := os.ReadFile(g.r.stateFile)
+	origin := g.r.opts.RepoURL
+	g.restart(func(o *Options) { o.RepoURL = filepath.Join(filepath.Dir(g.work), "missing.git") })
+	if err := g.r.Tick(); err == nil {
+		t.Fatal("want a clone error")
+	}
+	if got := g.gitOut("remote", "get-url", "origin"); got != origin {
+		t.Fatalf("old clone replaced: origin %s", got)
+	}
+	if _, err := os.Stat(g.r.repoDir + ".new"); !os.IsNotExist(err) {
+		t.Fatalf("leftover partial clone: %v", err)
+	}
+	if after, _ := os.ReadFile(g.r.stateFile); string(after) != string(before) {
+		t.Fatalf("state changed:\n%s\n%s", before, after)
+	}
+	g.restart(func(o *Options) { o.RepoURL = origin })
+	g.tick()
+}
+
+func TestAccessHint(t *testing.T) {
+	r := &Reconciler{SSHPub: "ssh-ed25519 AAAA ha-git-ops"}
+	github := "ERROR: Repository not found.\nfatal: Could not read from remote repository."
+	if h := r.accessHint(github); !strings.Contains(h, "deploy key") || !strings.Contains(h, r.SSHPub) {
+		t.Fatalf("hint = %q", h)
+	}
+	if h := r.accessHint("fatal: couldn't find remote ref main"); h != "" {
+		t.Fatalf("unrelated errors get no hint, got %q", h)
+	}
+}
