@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.0
+
+- **Unified diff view.** A *Side by side / Unified* toggle in the panel's
+  top bar. Unified shows each file as a plain two-way diff —
+  last-applied → live or live → target — that copies cleanly (line
+  numbers aren't part of the selection), with *Copy diff* per file and
+  *Copy all*. It's read-only; staging stays in the side-by-side view.
+
 ## 0.6.2
 
 - **Re-cloning no longer risks the working clone.** When `repo_url` or
