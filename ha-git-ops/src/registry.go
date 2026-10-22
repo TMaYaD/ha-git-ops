@@ -16,6 +16,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -121,16 +123,37 @@ func (r *Reconciler) registryLive(rel string) []byte {
 	return b
 }
 
+// parseRegistry reads desired content as id → managed fields, refusing
+// fields the registry API would reject mid-apply.
+func parseRegistry(def *registryDef, content []byte) (map[string]map[string]any, error) {
+	if content == nil {
+		return nil, fmt.Errorf("%s: deleting the whole registry file is not applied — remove individual items instead", def.rel)
+	}
+	var desired map[string]map[string]any
+	if err := yaml.Unmarshal(content, &desired); err != nil {
+		return nil, fmt.Errorf("%s: parse desired: %w", def.rel, err)
+	}
+	for _, id := range sortedKeys(desired) {
+		if id == "" {
+			return nil, fmt.Errorf("%s: item with an empty %s", def.rel, def.idKey)
+		}
+		for _, f := range sortedKeys(desired[id]) {
+			if !slices.Contains(def.fields, f) {
+				return nil, fmt.Errorf("%s: %q: unknown field %q (managed: %s)",
+					def.rel, id, f, strings.Join(def.fields, ", "))
+			}
+		}
+	}
+	return desired, nil
+}
+
 // registryWrite converges the live registry to the desired projection
 // with per-item create/update/delete websocket calls.
 func (r *Reconciler) registryWrite(rel string, content []byte) error {
 	def := registryFor(rel)
-	if content == nil {
-		return fmt.Errorf("%s: deleting the whole registry file is not applied — remove individual items instead", rel)
-	}
-	var desired map[string]map[string]any
-	if err := yaml.Unmarshal(content, &desired); err != nil {
-		return fmt.Errorf("%s: parse desired: %w", rel, err)
+	desired, err := parseRegistry(def, content)
+	if err != nil {
+		return err
 	}
 
 	live := map[string]any{}
