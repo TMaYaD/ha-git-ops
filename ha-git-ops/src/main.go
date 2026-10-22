@@ -1,7 +1,8 @@
 // ha-git-ops: ArgoCD-style GitOps reconciler for Home Assistant OS.
 // Git is desired state; incoming commits and live click-ops drift both
-// surface as reviewable diffs, and a human applies or promotes each —
-// nothing is written in either direction automatically.
+// surface as reviewable three-way diffs, and a human stages lines to
+// apply to live or commit to git — nothing is written in either
+// direction automatically.
 package main
 
 import (
@@ -48,7 +49,7 @@ func main() {
 
 	go func() {
 		log.Println("ingress UI listening on :8099")
-		if err := http.ListenAndServe(":8099", NewWebUI(rec)); err != nil {
+		if err := http.ListenAndServe(":8099", NewWebUI(rec, opts.Branch)); err != nil {
 			log.Fatalf("web server: %v", err)
 		}
 	}()
@@ -64,11 +65,9 @@ func main() {
 		if !opts.AutoApply {
 			return
 		}
-		if st, _ := rec.Snapshot(); st.PendingSHA != "" {
-			if err := rec.ApplyUpstream(); err != nil {
-				log.Printf("auto-apply failed: %v", err)
-				rec.SetError(err.Error())
-			}
+		if err := rec.AutoApply(); err != nil {
+			log.Printf("auto-apply failed: %v", err)
+			rec.SetError(err.Error())
 		}
 	}
 

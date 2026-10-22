@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.6.0
+
+- **Three-way panel.** Every file that needs a decision is one card
+  comparing three versions: *last-applied* (the git content HA was last
+  in sync with), *live* and *target* (the branch head). Toggle which
+  versions are shown; diffs compare only the shown ones and fold away
+  differences that exist only in a hidden one. Replaces the separate
+  Incoming / Changed in HA / Conflicts sections, so a file changed on
+  both sides — or missing live while git moved — is one card with a real
+  diff instead of a full deletion plus a full addition.
+- **Line-level staging into two buffers.** Gutter arrows stage the lines
+  their bar spans: last-applied → live (revert), target → live (apply)
+  and live → target (promote). Drag across text or click line numbers to
+  stage part of a change. Staged lines show in the column they will be
+  written to, boxed in their source colour with an undo badge; the
+  sidebar lists both buffers with **Apply to live** and **Commit & push**.
+  Promote takes applied live content only — a line staged into live must
+  be applied before it can be promoted. Staging survives the other
+  button: after a commit, staged live lines are re-derived on the new
+  diff (and vice versa), so merging both sides of a file takes two
+  clicks.
+- Writes are refused (HTTP 409) if any of the three versions changed
+  since the panel loaded them, so nothing reviewed can be stale; the
+  config check, rollback, targeted reloads and restart flag are as before.
+- Last-applied is tracked per file: a file whose live content matches
+  target is in sync at the new head even while others still differ, and
+  the global baseline fast-forwards once nothing is behind.
+- `auto_apply` now applies only files that changed in git alone; files
+  changed live are left for a human, as conflicts were before.
+- The secrets file is diffed with values replaced by keyed hashes — keys
+  and structure stay readable, equal values carry equal tags, and
+  nothing secret reaches the browser.
+- The panel is now a client-side page over a small JSON API
+  (`api/state`, `api/apply`, `api/commit`, `api/refresh`);
+  `go run ./cmd/preview` serves it against an in-memory fixture with
+  working apply and commit.
+
 ## 0.5.1
 
 - Prebuilt images: GitHub Actions builds per-arch images on each GitHub
