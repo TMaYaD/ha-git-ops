@@ -7,6 +7,11 @@
    - `subfolder` — repo path that mirrors `/config`, e.g. `home-assistant/config`
    - `branch`, `poll_interval`, `auto_refresh`, `auto_apply`,
      `auto_restart_core` as you like
+   - Changing `repo_url`, `branch` or `subfolder` later (say, after moving
+     the config to another repo) takes effect on the next start: the
+     clone is replaced, and each file keeps what was last applied from the
+     previous target — even if that repo no longer exists — until it
+     converges on the new one. Nothing is written.
    - `notify_drift`, `notify_service` — notifications for files awaiting
      a decision, and optional push routing (see Behavior below)
 2. Start it once. The log prints two public keys:
@@ -70,8 +75,10 @@ refresh and review again.
   `auto_refresh: false` disables background polling entirely — the
   panel's Refresh button becomes the only fetch. Defaults:
   `auto_refresh: true`, `auto_apply: false`.
-- Last-applied is tracked per file: a file whose live content matches
-  target is in sync at the new head even while others still differ.
+- Last-applied is tracked per file and stored on disk (`/data/baseline`)
+  when the file converges: a file whose live content matches target is in
+  sync at the new head even while others still differ, and last-applied
+  does not depend on git history staying reachable.
   Commits that would change nothing live (e.g. a sops re-encryption to
   the same plaintext) fast-forward the baseline silently.
 - A file changed **both** in git and live is never auto-resolved; you

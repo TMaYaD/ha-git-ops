@@ -668,6 +668,7 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
           var n = S.buf[f.rel] ? Object.keys(S.buf[f.rel][v.key] || {}).length : 0;
           return h('div', { class: 'nm ' + v.key }, v.name,
             v.key === 'base' ? h('code', { text: short(f.baseSha) }) : v.key === 'target' ? h('code', { text: short(S.data.targetSha) }) : null,
+            v.key === 'base' && f.baseMoved ? h('span', { class: 'bufn', text: 'from the previous target' }) : null,
             n ? h('span', { class: 'bufn', text: 'buffer · ' + n + ' staged' }) : null);
         }, function () { return h('div'); })),
         rowsEl)));
@@ -792,7 +793,7 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
               c[1] + ' ', h('span', { class: 'n', text: String(c[2]) }));
           })));
       var desc = {
-        base: ['synced to HA · ', short(d.appliedSha) + (d.aheadBaselines ? ' (+' + plural(d.aheadBaselines, 'file') + ' newer)' : '')],
+        base: ['synced to HA · ', short(d.appliedSha) + (d.movedBaselines ? ' (' + plural(d.movedBaselines, 'file') + ' from the previous target)' : '')],
         live: ['what Home Assistant runs now', null],
         target: ['desired state · ' + d.branch + ' @ ', short(d.targetSha)]
       };

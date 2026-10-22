@@ -27,19 +27,22 @@ var page []byte
 
 // API shapes; cmd/preview mirrors them.
 type apiFile struct {
-	Rel     string      `json:"rel"`
-	Kind    string      `json:"kind"`
-	Token   string      `json:"token"`
-	BaseSHA string      `json:"baseSha"`
-	Absent  [3]bool     `json:"absent"` // base, live, target
-	Masked  bool        `json:"masked"`
-	Rows    []diff3.Row `json:"rows"`
+	Rel     string `json:"rel"`
+	Kind    string `json:"kind"`
+	Token   string `json:"token"`
+	BaseSHA string `json:"baseSha"`
+	// BaseMoved marks last-applied taken from a previous target (another
+	// repo, branch or subfolder) that this file hasn't converged away from.
+	BaseMoved bool        `json:"baseMoved"`
+	Absent    [3]bool     `json:"absent"` // base, live, target
+	Masked    bool        `json:"masked"`
+	Rows      []diff3.Row `json:"rows"`
 }
 
 type apiState struct {
 	Branch          string    `json:"branch"`
 	AppliedSHA      string    `json:"appliedSha"`
-	AheadBaselines  int       `json:"aheadBaselines"`
+	MovedBaselines  int       `json:"movedBaselines"`
 	TargetSHA       string    `json:"targetSha"`
 	Error           string    `json:"error"`
 	RestartRequired bool      `json:"restartRequired"`
@@ -64,16 +67,16 @@ func NewWebUI(rec *Reconciler, branch string) http.Handler {
 		log.Fatalf("mask key: %v", err)
 	}
 	state := func() apiState {
-		st, applied, ahead := rec.Snapshot()
+		st, applied, moved := rec.Snapshot()
 		out := apiState{
-			Branch: branch, AppliedSHA: applied, AheadBaselines: ahead,
+			Branch: branch, AppliedSHA: applied, MovedBaselines: moved,
 			TargetSHA: st.TargetSHA, Error: st.Error,
 			RestartRequired: st.RestartRequired, LastSync: st.LastSync,
 			Files: []apiFile{},
 		}
 		for _, f := range st.Files {
 			af := apiFile{
-				Rel: f.Rel, Kind: f.Kind, Token: f.Token, BaseSHA: f.BaseSHA,
+				Rel: f.Rel, Kind: f.Kind, Token: f.Token, BaseSHA: f.BaseCommit, BaseMoved: f.BaseMoved,
 				Absent: [3]bool{f.Base == nil, f.Live == nil, f.Target == nil},
 				Rows:   f.Rows,
 			}

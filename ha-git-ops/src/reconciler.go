@@ -73,7 +73,8 @@ var (
 type FileState struct {
 	Rel                string
 	Kind               string
-	BaseSHA            string
+	BaseCommit         string // commit last-applied was taken at
+	BaseMoved          bool   // taken from a target other than the current one
 	Base, Live, Target []byte
 	Rows               []diff3.Row
 	Token              string
@@ -88,21 +89,43 @@ type Status struct {
 }
 
 type persistedState struct {
+	// AppliedSHA is the head at which every file was last in sync.
 	AppliedSHA string `json:"applied_sha"`
-	// Files that converged on a newer target while others still differ
-	// keep their own baseline until AppliedSHA catches up.
-	Baselines map[string]string `json:"baselines,omitempty"`
+	// Baseline is each file's last-applied: a copy of its stored git
+	// content, taken whenever the file converges and kept on disk, so it
+	// survives the target moving to another repo, branch or subfolder —
+	// even one that no longer exists. A file without an entry has never
+	// been applied. nil until the first baseline is taken.
+	Baseline map[string]baseEntry `json:"baseline"`
+	// Target is the repo, branch and subfolder being tracked.
+	Target *targetID `json:"target,omitempty"`
+	// LegacyBaselines holds 0.6.0's per-file baseline commits, read once
+	// to migrate into Baseline.
+	LegacyBaselines map[string]string `json:"baselines,omitempty"`
+}
+
+type baseEntry struct {
+	Blob   string   `json:"blob"`   // sha256 of the raw content in the baseline store
+	Commit string   `json:"commit"` // commit the content was taken at
+	Target targetID `json:"target"` // where that commit lives
+}
+
+type targetID struct {
+	RepoURL   string `json:"repo_url"`
+	Branch    string `json:"branch"`
+	Subfolder string `json:"subfolder"`
 }
 
 type Reconciler struct {
-	opts       Options
-	ha         *HA
-	repoDir    string
-	configDir  string
-	stateFile  string
-	ageKeyFile string
-	sshKeyFile string
-	backupsDir string
+	opts        Options
+	ha          *HA
+	repoDir     string
+	configDir   string
+	stateFile   string
+	ageKeyFile  string
+	sshKeyFile  string
+	backupsDir  string
+	snapshotDir string
 
 	AgePub string
 	SSHPub string
@@ -115,14 +138,15 @@ type Reconciler struct {
 
 func NewReconciler(opts Options, ha *HA) *Reconciler {
 	r := &Reconciler{
-		opts:       opts,
-		ha:         ha,
-		repoDir:    "/data/repo",
-		configDir:  "/homeassistant",
-		stateFile:  "/data/state.json",
-		ageKeyFile: "/data/age.key",
-		sshKeyFile: "/data/ssh/id_ed25519",
-		backupsDir: "/data/backups",
+		opts:        opts,
+		ha:          ha,
+		repoDir:     "/data/repo",
+		configDir:   "/homeassistant",
+		stateFile:   "/data/state.json",
+		ageKeyFile:  "/data/age.key",
+		sshKeyFile:  "/data/ssh/id_ed25519",
+		backupsDir:  "/data/backups",
+		snapshotDir: "/data/baseline",
 	}
 	if raw, err := os.ReadFile(r.stateFile); err == nil {
 		_ = json.Unmarshal(raw, &r.state)
@@ -131,13 +155,23 @@ func NewReconciler(opts Options, ha *HA) *Reconciler {
 }
 
 // Snapshot returns a copy of the current status, the applied SHA and how
-// many files carry their own newer baseline.
+// many files' last-applied still comes from a previous target.
 func (r *Reconciler) Snapshot() (Status, string, int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	st := r.status
 	st.Files = append([]FileState(nil), r.status.Files...)
-	return st, r.state.AppliedSHA, len(r.state.Baselines)
+	moved := 0
+	for _, e := range r.state.Baseline {
+		if e.Target != r.target() {
+			moved++
+		}
+	}
+	return st, r.state.AppliedSHA, moved
+}
+
+func (r *Reconciler) target() targetID {
+	return targetID{RepoURL: r.opts.RepoURL, Branch: r.opts.Branch, Subfolder: r.opts.Subfolder}
 }
 
 func (r *Reconciler) SetError(msg string) {
@@ -207,12 +241,38 @@ func (r *Reconciler) git(args ...string) (string, error) {
 	return out.String(), nil
 }
 
+// ensureRepo makes /data/repo a clone of the configured repo with the
+// configured subfolder checked out, replacing a clone left over from a
+// different repo_url or subfolder. Last-applied lives in the baseline
+// store, not in the clone, so replacing it loses nothing — except for
+// state from 0.6.0, which only recorded commits and is migrated from
+// whichever clone is at hand first.
 func (r *Reconciler) ensureRepo() error {
-	if _, err := os.Stat(filepath.Join(r.repoDir, ".git")); err == nil {
-		return nil
-	}
 	if r.opts.RepoURL == "" {
 		return fmt.Errorf("repo_url is not configured")
+	}
+	_, statErr := os.Stat(filepath.Join(r.repoDir, ".git"))
+	exists := statErr == nil
+	if exists {
+		url, _ := r.git("remote", "get-url", "origin")
+		sparse, _ := r.git("sparse-checkout", "list")
+		url, sparse = strings.TrimSpace(url), strings.Trim(strings.TrimSpace(sparse), "/")
+		matches := url == r.opts.RepoURL && sparse == r.opts.Subfolder
+		from := targetID{RepoURL: url, Subfolder: sparse}
+		if matches {
+			from.Branch = r.opts.Branch
+		}
+		if err := r.migrateLegacy(from); err != nil {
+			return err
+		}
+		if matches {
+			return r.configureRepo()
+		}
+		log.Printf("clone at %s tracks %s:%s; re-cloning for %s:%s",
+			r.repoDir, url, sparse, r.opts.RepoURL, r.opts.Subfolder)
+		if err := os.RemoveAll(r.repoDir); err != nil {
+			return err
+		}
 	}
 	cmd := exec.Command("git", "clone", "--filter=blob:none", "--no-checkout",
 		"--branch", r.opts.Branch, r.opts.RepoURL, r.repoDir)
@@ -223,6 +283,25 @@ func (r *Reconciler) ensureRepo() error {
 	for _, args := range [][]string{
 		{"sparse-checkout", "set", r.opts.Subfolder},
 		{"checkout", r.opts.Branch},
+	} {
+		if _, err := r.git(args...); err != nil {
+			return err
+		}
+	}
+	if !exists {
+		// 0.6.0 state with its clone gone: the same target re-cloned still
+		// has the commits.
+		if err := r.migrateLegacy(r.target()); err != nil {
+			return err
+		}
+	}
+	return r.configureRepo()
+}
+
+// configureRepo applies the commit identity, which may change between
+// restarts without anything else changing.
+func (r *Reconciler) configureRepo() error {
+	for _, args := range [][]string{
 		{"config", "user.name", r.opts.CommitName},
 		{"config", "user.email", r.opts.CommitEmail},
 	} {
@@ -231,6 +310,43 @@ func (r *Reconciler) ensureRepo() error {
 		}
 	}
 	return nil
+}
+
+// migrateLegacy turns 0.6.0's baseline commits into stored last-applied
+// content, read from the current clone, which tracks from. It does
+// nothing once migrated, on a first run, or when the clone lacks the
+// commits — Tick then starts a fresh baseline.
+func (r *Reconciler) migrateLegacy(from targetID) error {
+	if r.state.Baseline != nil || r.state.AppliedSHA == "" || !r.hasCommit(r.state.AppliedSHA) {
+		return nil
+	}
+	rels, err := r.trackedRels(r.state.AppliedSHA, from.Subfolder)
+	if err != nil {
+		return err
+	}
+	for rel := range r.state.LegacyBaselines {
+		rels = append(rels, rel)
+	}
+	base := map[string]baseEntry{}
+	for _, rel := range rels {
+		commit := r.state.AppliedSHA
+		if sha, ok := r.state.LegacyBaselines[rel]; ok {
+			commit = sha
+		}
+		raw := r.rawAt(commit, from.Subfolder, rel)
+		if raw == nil {
+			continue
+		}
+		blob, err := r.storeBlob(raw)
+		if err != nil {
+			return err
+		}
+		base[rel] = baseEntry{Blob: blob, Commit: commit, Target: from}
+	}
+	r.state.Baseline = base
+	r.state.LegacyBaselines = nil
+	log.Printf("migrated last-applied of %d file(s) from %.9s into the baseline store", len(base), r.state.AppliedSHA)
+	return r.saveState()
 }
 
 // fetchRemote fetches the branch and returns its head.
@@ -248,19 +364,38 @@ func (r *Reconciler) fetchRemote() (string, error) {
 	return strings.TrimSpace(remote), nil
 }
 
-// atRef returns desired content at a git ref (nil if absent), in the
-// same shape live() produces: the secrets file decrypted, dashboards
-// canonicalized.
-func (r *Reconciler) atRef(ref, rel string) []byte {
+// hasCommit reports whether sha is a commit in the clone.
+func (r *Reconciler) hasCommit(sha string) bool {
+	_, err := r.git("cat-file", "-e", sha+"^{commit}")
+	return err == nil
+}
+
+// rawAt returns rel's stored form (the secrets file still encrypted) at a
+// git ref under subfolder sub; nil if absent.
+func (r *Reconciler) rawAt(ref, sub, rel string) []byte {
 	src := rel
 	if rel == secretsPlain {
 		src = secretsSops
 	}
-	cmd := exec.Command("git", "-C", r.repoDir, "show",
-		ref+":"+r.opts.Subfolder+"/"+src)
+	cmd := exec.Command("git", "-C", r.repoDir, "show", ref+":"+sub+"/"+src)
 	cmd.Env = r.gitEnv()
 	out, err := cmd.Output()
 	if err != nil {
+		return nil
+	}
+	return out
+}
+
+// atRef returns desired content at a git ref (nil if absent), in the
+// same shape live() produces.
+func (r *Reconciler) atRef(ref, rel string) []byte {
+	return r.shape(rel, r.rawAt(ref, r.opts.Subfolder, rel), ref)
+}
+
+// shape turns a stored form into what live() produces: the secrets file
+// decrypted, dashboards canonicalized. from labels errors.
+func (r *Reconciler) shape(rel string, out []byte, from string) []byte {
+	if out == nil {
 		return nil
 	}
 	if rel == secretsPlain {
@@ -274,7 +409,7 @@ func (r *Reconciler) atRef(ref, rel string) []byte {
 	if isDashboard(rel) || isRegistry(rel) {
 		canon, err := CanonYAML(out)
 		if err != nil {
-			log.Printf("canonicalize %s@%.9s failed: %v", rel, ref, err)
+			log.Printf("canonicalize %s@%.9s failed: %v", rel, from, err)
 			return nil
 		}
 		return canon
@@ -296,27 +431,38 @@ func (r *Reconciler) decrypt(blob []byte) ([]byte, error) {
 	return out.Bytes(), nil
 }
 
-// managedRels is the union of rel-paths tracked in git at ref (in
-// live-file naming) and live storage-mode dashboards, so click-ops
-// dashboards not yet in git surface as adoptable drift.
-func (r *Reconciler) managedRels(ref string) ([]string, error) {
-	out, err := r.git("ls-tree", "-r", "--name-only", ref, "--", r.opts.Subfolder)
+// trackedRels lists the files tracked in git at ref under subfolder sub,
+// in live-file naming.
+func (r *Reconciler) trackedRels(ref, sub string) ([]string, error) {
+	out, err := r.git("ls-tree", "-r", "--name-only", ref, "--", sub)
 	if err != nil {
 		return nil, err
 	}
-	seen := map[string]bool{}
 	var rels []string
-	prefix := r.opts.Subfolder + "/"
 	for _, p := range strings.Split(strings.TrimSpace(out), "\n") {
 		if p == "" {
 			continue
 		}
-		rel := strings.TrimPrefix(p, prefix)
+		rel := strings.TrimPrefix(p, sub+"/")
 		if rel == secretsSops {
 			rel = secretsPlain
 		}
-		seen[rel] = true
 		rels = append(rels, rel)
+	}
+	return rels, nil
+}
+
+// managedRels is the union of rel-paths tracked in git at ref (in
+// live-file naming) and live storage-mode dashboards, so click-ops
+// dashboards not yet in git surface as adoptable drift.
+func (r *Reconciler) managedRels(ref string) ([]string, error) {
+	rels, err := r.trackedRels(ref, r.opts.Subfolder)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	for _, rel := range rels {
+		seen[rel] = true
 	}
 	dbs, err := r.liveDashboards()
 	if err != nil {
@@ -410,11 +556,71 @@ func same(a, b []byte) bool {
 	return (a == nil) == (b == nil) && bytes.Equal(a, b)
 }
 
-func (r *Reconciler) baselineFor(rel string) string {
-	if sha, ok := r.state.Baselines[rel]; ok {
-		return sha
+// storeBlob saves raw content in the baseline store under its hash.
+func (r *Reconciler) storeBlob(raw []byte) (string, error) {
+	sum := sha256.Sum256(raw)
+	blob := hex.EncodeToString(sum[:])
+	path := filepath.Join(r.snapshotDir, blob)
+	if _, err := os.Stat(path); err == nil {
+		return blob, nil
 	}
-	return r.state.AppliedSHA
+	if err := os.MkdirAll(r.snapshotDir, 0o700); err != nil {
+		return "", err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		return "", err
+	}
+	return blob, os.Rename(tmp, path)
+}
+
+// baseContent is rel's last-applied content, nil if never applied.
+func (r *Reconciler) baseContent(rel string) []byte {
+	e, ok := r.state.Baseline[rel]
+	if !ok {
+		return nil
+	}
+	raw, err := os.ReadFile(filepath.Join(r.snapshotDir, e.Blob))
+	if err != nil {
+		log.Printf("baseline of %s unreadable: %v", rel, err)
+		return nil
+	}
+	return r.shape(rel, raw, e.Commit)
+}
+
+// applied records rel's content at commit on the current target as its
+// last-applied; absent content clears it.
+func (r *Reconciler) applied(rel, commit string) error {
+	raw := r.rawAt(commit, r.opts.Subfolder, rel)
+	if raw == nil {
+		delete(r.state.Baseline, rel)
+		return nil
+	}
+	blob, err := r.storeBlob(raw)
+	if err != nil {
+		return err
+	}
+	r.state.Baseline[rel] = baseEntry{Blob: blob, Commit: commit, Target: r.target()}
+	return nil
+}
+
+// pruneBlobs removes stored content no file refers to any more — e.g. the
+// last-applied of a previous target once its files converged on the new
+// one.
+func (r *Reconciler) pruneBlobs() {
+	keep := map[string]bool{}
+	for _, e := range r.state.Baseline {
+		keep[e.Blob] = true
+	}
+	entries, err := os.ReadDir(r.snapshotDir)
+	if err != nil {
+		return
+	}
+	for _, d := range entries {
+		if !keep[d.Name()] {
+			_ = os.Remove(filepath.Join(r.snapshotDir, d.Name()))
+		}
+	}
 }
 
 // token fingerprints the three versions a decision was made on.
@@ -432,9 +638,10 @@ func token(vs ...[]byte) string {
 }
 
 func (r *Reconciler) fileState(rel, remote string) FileState {
-	baseSHA := r.baselineFor(rel)
-	b, l, t := r.atRef(baseSHA, rel), r.live(rel), r.atRef(remote, rel)
-	fs := FileState{Rel: rel, BaseSHA: baseSHA, Base: b, Live: l, Target: t}
+	e := r.state.Baseline[rel]
+	b, l, t := r.baseContent(rel), r.live(rel), r.atRef(remote, rel)
+	fs := FileState{Rel: rel, BaseCommit: e.Commit, Base: b, Live: l, Target: t}
+	fs.BaseMoved = b != nil && e.Target != r.target()
 	if same(l, t) {
 		return fs
 	}
@@ -452,27 +659,20 @@ func (r *Reconciler) fileState(rel, remote string) FileState {
 	return fs
 }
 
-// computeLocked rebuilds the per-file state against remote and advances
-// baselines: a file whose live content matches target is in sync at
-// remote, and once no file is behind remote AppliedSHA moves there too.
+// computeLocked rebuilds the per-file state against remote. A file whose
+// live content matches target is in sync, so that content is now its
+// last-applied; once no file is behind remote, AppliedSHA moves there.
 func (r *Reconciler) computeLocked(remote string) error {
-	seen := map[string]bool{}
-	var rels []string
-	for _, ref := range []string{r.state.AppliedSHA, remote} {
-		rs, err := r.managedRels(ref)
-		if err != nil {
-			return err
-		}
-		for _, rel := range rs {
-			if !seen[rel] {
-				seen[rel] = true
-				rels = append(rels, rel)
-			}
-		}
+	rels, err := r.managedRels(remote)
+	if err != nil {
+		return err
 	}
-	for rel := range r.state.Baselines {
+	seen := map[string]bool{}
+	for _, rel := range rels {
+		seen[rel] = true
+	}
+	for rel := range r.state.Baseline {
 		if !seen[rel] {
-			seen[rel] = true
 			rels = append(rels, rel)
 		}
 	}
@@ -483,11 +683,10 @@ func (r *Reconciler) computeLocked(remote string) error {
 	for _, rel := range rels {
 		fs := r.fileState(rel, remote)
 		if fs.Kind == "" {
-			if fs.BaseSHA != remote && !same(fs.Base, fs.Target) {
-				if r.state.Baselines == nil {
-					r.state.Baselines = map[string]string{}
+			if !same(fs.Base, fs.Target) || fs.BaseMoved {
+				if err := r.applied(rel, remote); err != nil {
+					return err
 				}
-				r.state.Baselines[rel] = remote
 				dirty = true
 			}
 			continue
@@ -497,16 +696,16 @@ func (r *Reconciler) computeLocked(remote string) error {
 		}
 		files = append(files, fs)
 	}
-	if !behind && (r.state.AppliedSHA != remote || len(r.state.Baselines) > 0) {
+	if !behind && r.state.AppliedSHA != remote {
 		// Nothing user-visible would change by moving the baseline (e.g. a
 		// sops re-encryption to the same plaintext, or commits live already
 		// matches): fast-forward without touching HA.
 		log.Printf("fast-forwarded baseline to %.9s", remote)
 		r.state.AppliedSHA = remote
-		r.state.Baselines = nil
 		dirty = true
 	}
 	if dirty {
+		r.pruneBlobs()
 		if err := r.saveState(); err != nil {
 			return err
 		}
@@ -526,14 +725,8 @@ func (r *Reconciler) Tick() error {
 	if err != nil {
 		return err
 	}
-	if r.state.AppliedSHA == "" {
-		// First run: baseline only, write nothing. Differences appear for
-		// the human to converge deliberately.
-		r.state.AppliedSHA = remote
-		if err := r.saveState(); err != nil {
-			return err
-		}
-		log.Printf("baselined at %.9s without applying (first run)", remote)
+	if err := r.baselineLocked(remote); err != nil {
+		return err
 	}
 	if err := r.computeLocked(remote); err != nil {
 		return err
@@ -541,6 +734,61 @@ func (r *Reconciler) Tick() error {
 	r.status.Error = ""
 	r.finishLocked()
 	return nil
+}
+
+// baselineLocked takes the first baseline at remote without writing
+// anything — on a first run, or when 0.6.0 state couldn't be migrated
+// because its commits are gone — and records the target being tracked.
+// When the target moved, last-applied stays as stored until each file
+// converges on the new one.
+func (r *Reconciler) baselineLocked(remote string) error {
+	id := r.target()
+	moved := r.state.Target != nil && *r.state.Target != id
+	dirty := r.state.Target == nil || moved
+	if r.state.Baseline == nil {
+		lost := r.state.AppliedSHA
+		rels, err := r.trackedRels(remote, r.opts.Subfolder)
+		if err != nil {
+			return err
+		}
+		r.state = persistedState{AppliedSHA: remote, Baseline: map[string]baseEntry{}}
+		for _, rel := range rels {
+			if err := r.applied(rel, remote); err != nil {
+				return err
+			}
+		}
+		dirty, moved = true, false
+		if lost == "" {
+			log.Printf("baselined at %.9s without applying (first run)", remote)
+		} else {
+			log.Printf("last-applied commit %.9s is gone; baselined at %.9s without applying", lost, remote)
+			r.ha.Persist("GitOps: baseline reset", fmt.Sprintf(
+				"The last-applied commit %.9s is no longer reachable and there was "+
+					"no stored copy of it, so the add-on baselined at %.9s without "+
+					"writing anything.", lost, remote))
+		}
+	}
+	if !moved && r.state.Target == nil {
+		// First target recorded: report a move when what was applied came
+		// from somewhere else (0.6.0 state migrated from a stale clone).
+		for _, e := range r.state.Baseline {
+			moved = moved || e.Target != id
+		}
+	}
+	if moved {
+		log.Printf("target is now %s %s:%s; last-applied kept until each file converges",
+			id.RepoURL, id.Branch, id.Subfolder)
+		r.ha.Persist("GitOps: target changed", fmt.Sprintf(
+			"Now tracking `%s` on branch `%s` in `%s`. Each file keeps what was "+
+				"last applied from the previous target until it converges on the "+
+				"new one, so the panel still shows which side changed.",
+			id.Subfolder, id.Branch, id.RepoURL))
+	}
+	if !dirty {
+		return nil
+	}
+	r.state.Target = &id
+	return r.saveState()
 }
 
 // finishLocked publishes the recomputed state.
