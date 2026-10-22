@@ -16,7 +16,9 @@
      a decision, and optional push routing (see Behavior below)
 2. Start it once. The log prints two public keys:
    - the **ssh deploy key** — add it to the git host with **write** access
-     (write is needed for promote)
+     (write is needed for commits). On GitHub a deploy key belongs to one
+     repository: if you later move the config to another repo, remove the
+     key from the old one and add it to the new one.
    - the **age public key** — append it to the repo's `.sops.yaml`
      recipients, then run `sops updatekeys <path>/secrets.sops.yaml`
      from a machine holding an existing recipient key, and commit
