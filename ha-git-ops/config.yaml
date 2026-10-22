@@ -1,7 +1,7 @@
 name: HA GitOps
-version: 0.5.1
+version: 0.6.0
 slug: ha_git_ops
-description: ArgoCD-style GitOps reconciler — incoming commits and click-ops drift surface as diffs for a human to apply or promote
+description: ArgoCD-style GitOps reconciler — three-way diffs of last-applied, live and target; stage lines to apply to HA or commit to git
 url: https://github.com/TMaYaD/ha-git-ops
 image: ghcr.io/tmayad/{arch}-ha-git-ops
 arch:

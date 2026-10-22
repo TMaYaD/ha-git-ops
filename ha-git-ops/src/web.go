@@ -1,152 +1,205 @@
 package main
 
-// Ingress UI: status, per-file diffs, refresh / apply / promote actions.
-// Served under HA ingress — all URLs are relative so the ingress path
-// prefix is transparent. Secrets diffs are masked to key names only.
+// Ingress UI: a single page that loads the three-way state as JSON and
+// posts staged picks back. Served under HA ingress — all URLs are
+// relative so the ingress path prefix is transparent. The secrets file
+// travels masked: keys plus a keyed hash per value, so equal values
+// still compare equal without revealing them.
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	_ "embed"
-	"html/template"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
+
+	"github.com/TMaYaD/ha-git-ops/diff3"
 )
 
-//go:embed page.gohtml
-var pageSrc string
+//go:embed page.html
+var page []byte
 
-var page = template.Must(template.New("page").Parse(pageSrc))
-
-type fileView struct {
-	Rel, Why, Diff string
-	CanRevert      bool
+// API shapes; cmd/preview mirrors them.
+type apiFile struct {
+	Rel     string      `json:"rel"`
+	Kind    string      `json:"kind"`
+	Token   string      `json:"token"`
+	BaseSHA string      `json:"baseSha"`
+	Absent  [3]bool     `json:"absent"` // base, live, target
+	Masked  bool        `json:"masked"`
+	Rows    []diff3.Row `json:"rows"`
 }
 
-// done returns a tiny self-refreshing page instead of a 303 — HA's
-// ingress iframe mishandles redirect responses to form POSTs and gets
-// stuck on a loading screen.
-func done(w http.ResponseWriter, what string) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write([]byte(`<!doctype html><meta http-equiv="refresh" content="1;url=./">` +
-		`<body style="font-family:system-ui;margin:1.5rem">✓ ` +
-		template.HTMLEscapeString(what) + ` — refreshing…</body>`))
+type apiState struct {
+	Branch          string    `json:"branch"`
+	AppliedSHA      string    `json:"appliedSha"`
+	AheadBaselines  int       `json:"aheadBaselines"`
+	TargetSHA       string    `json:"targetSha"`
+	Error           string    `json:"error"`
+	RestartRequired bool      `json:"restartRequired"`
+	LastSync        string    `json:"lastSync"`
+	Files           []apiFile `json:"files"`
 }
 
-type pageView struct {
-	StatusHTML      template.HTML
-	RestartRequired bool
-	Conflicts       []fileView
-	Incoming        []fileView
-	Files           []fileView
-	PromoteAll      bool
-	InSync          bool
+type apiPicks struct {
+	Rel   string            `json:"rel"`
+	Token string            `json:"token"`
+	Rows  map[string]string `json:"rows"`
 }
 
-func NewWebUI(rec *Reconciler) http.Handler {
-	mux := http.NewServeMux()
+type apiWrite struct {
+	Message string     `json:"message"`
+	Files   []apiPicks `json:"files"`
+}
 
-	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, req *http.Request) {
-		st, sha := rec.Snapshot()
-		if len(sha) > 9 {
-			sha = sha[:9]
+func NewWebUI(rec *Reconciler, branch string) http.Handler {
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		log.Fatalf("mask key: %v", err)
+	}
+	state := func() apiState {
+		st, applied, ahead := rec.Snapshot()
+		out := apiState{
+			Branch: branch, AppliedSHA: applied, AheadBaselines: ahead,
+			TargetSHA: st.TargetSHA, Error: st.Error,
+			RestartRequired: st.RestartRequired, LastSync: st.LastSync,
+			Files: []apiFile{},
 		}
-		v := pageView{
-			RestartRequired: st.RestartRequired,
-			InSync: st.Error == "" && len(st.Conflicts) == 0 &&
-				len(st.Drift) == 0 && len(st.Incoming) == 0,
-		}
-
-		var status string
-		switch {
-		case st.Error != "":
-			status = `<span class="bad">✗ ` + template.HTMLEscapeString(st.Error) + `</span>`
-		case len(st.Conflicts) > 0:
-			status = `<span class="bad">⚠ conflicts</span>`
-		case len(st.Incoming) > 0:
-			status = `<span class="info">↓ updates in git</span>`
-		case len(st.Drift) > 0:
-			status = `<span class="warn">● drift</span>`
-		default:
-			status = `<span class="ok">✓ in sync</span>`
-		}
-		last := st.LastSync
-		if last == "" {
-			last = "never"
-		}
-		v.StatusHTML = template.HTML(status +
-			` <span class="nw">applied <code>` + template.HTMLEscapeString(sha) + `</code></span>` +
-			` <span class="nw">· last refresh ` + template.HTMLEscapeString(last) + `</span>`)
-
-		for _, rel := range sortedKeys(st.Conflicts) {
-			v.Conflicts = append(v.Conflicts, fileView{Rel: rel, Why: st.Conflicts[rel]})
-		}
-		for _, rel := range sortedKeys(st.Incoming) {
-			v.Incoming = append(v.Incoming, fileView{
-				Rel: rel, Why: st.Incoming[rel], Diff: rec.IncomingDiffText(rel)})
-		}
-		for _, rel := range sortedKeys(st.Drift) {
-			v.Files = append(v.Files, fileView{
-				Rel: rel, Why: st.Drift[rel], Diff: rec.DiffText(rel),
-				CanRevert: rec.CanRevert(rel)})
-		}
-		v.PromoteAll = len(v.Files) > 1
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_ = page.Execute(w, v)
-	})
-
-	mux.HandleFunc("POST /refresh", func(w http.ResponseWriter, req *http.Request) {
-		if err := rec.RefreshNow(); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		done(w, "refreshed")
-	})
-
-	mux.HandleFunc("POST /apply", func(w http.ResponseWriter, req *http.Request) {
-		if err := rec.ApplyUpstream(); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		done(w, "applied updates from git")
-	})
-
-	mux.HandleFunc("POST /revert", func(w http.ResponseWriter, req *http.Request) {
-		rel := req.FormValue("rel")
-		if rel == "" || strings.Contains(rel, "..") {
-			http.Error(w, "bad rel", http.StatusBadRequest)
-			return
-		}
-		if err := rec.Revert(rel); err != nil {
-			log.Printf("revert %s failed: %v", rel, err)
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		done(w, "applied git version of "+rel)
-	})
-
-	mux.HandleFunc("POST /promote", func(w http.ResponseWriter, req *http.Request) {
-		if err := req.ParseForm(); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		rels := req.PostForm["rel"]
-		if len(rels) == 0 {
-			http.Error(w, "no files", http.StatusBadRequest)
-			return
-		}
-		for _, rel := range rels {
-			if strings.Contains(rel, "..") {
-				http.Error(w, "bad rel", http.StatusBadRequest)
-				return
+		for _, f := range st.Files {
+			af := apiFile{
+				Rel: f.Rel, Kind: f.Kind, Token: f.Token, BaseSHA: f.BaseSHA,
+				Absent: [3]bool{f.Base == nil, f.Live == nil, f.Target == nil},
+				Rows:   f.Rows,
 			}
+			if f.Rel == secretsPlain {
+				af.Masked = true
+				af.Rows = maskRows(key, f.Rows)
+			}
+			out.Files = append(out.Files, af)
 		}
-		if err := rec.Promote(rels, req.FormValue("message")); err != nil {
-			log.Printf("promote %v failed: %v", rels, err)
-			http.Error(w, err.Error(), http.StatusConflict)
+		return out
+	}
+	writeJSON := func(w http.ResponseWriter, status int, v any) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(v)
+	}
+	fail := func(w http.ResponseWriter, err error) {
+		status := http.StatusInternalServerError
+		switch {
+		case errors.Is(err, ErrStale):
+			status = http.StatusConflict
+		case errors.Is(err, ErrRolledBack):
+			status = http.StatusUnprocessableEntity
+		}
+		writeJSON(w, status, map[string]any{"error": err.Error(), "state": state()})
+	}
+	decode := func(req *http.Request) (apiWrite, []Picks, error) {
+		var body apiWrite
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			return body, nil, err
+		}
+		var picks []Picks
+		for _, f := range body.Files {
+			p := Picks{Rel: f.Rel, Token: f.Token, Rows: map[int]diff3.Col{}}
+			for k, v := range f.Rows {
+				i, err := strconv.Atoi(k)
+				c, ok := diff3.ParseCol(v)
+				if err != nil || !ok {
+					return body, nil, errors.New("bad pick " + k + "=" + v)
+				}
+				p.Rows[i] = c
+			}
+			picks = append(picks, p)
+		}
+		return body, picks, nil
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(page)
+	})
+	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, req *http.Request) {
+		writeJSON(w, http.StatusOK, state())
+	})
+	mux.HandleFunc("POST /api/refresh", func(w http.ResponseWriter, req *http.Request) {
+		if err := rec.RefreshNow(); err != nil {
+			rec.SetError(err.Error())
+			fail(w, err)
 			return
 		}
-		done(w, "promoted")
+		writeJSON(w, http.StatusOK, state())
 	})
-
+	mux.HandleFunc("POST /api/apply", func(w http.ResponseWriter, req *http.Request) {
+		_, picks, err := decode(req)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if err := rec.ApplyLive(picks); err != nil {
+			log.Printf("apply failed: %v", err)
+			fail(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, state())
+	})
+	mux.HandleFunc("POST /api/commit", func(w http.ResponseWriter, req *http.Request) {
+		body, picks, err := decode(req)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		if err := rec.CommitTarget(picks, body.Message); err != nil {
+			log.Printf("commit failed: %v", err)
+			fail(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, state())
+	})
 	return mux
+}
+
+// maskRows replaces each secret value with a short keyed hash, keeping
+// keys, indentation and comments readable.
+func maskRows(key []byte, rows []diff3.Row) []diff3.Row {
+	out := make([]diff3.Row, len(rows))
+	for i, r := range rows {
+		for c, s := range r {
+			if s == nil {
+				continue
+			}
+			m := maskLine(key, *s)
+			out[i][c] = &m
+		}
+	}
+	return out
+}
+
+func maskLine(key []byte, line string) string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+		return line
+	}
+	k, v, found := strings.Cut(line, ":")
+	if !found {
+		k, v = "", line
+	}
+	if strings.TrimSpace(v) == "" {
+		return line
+	}
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(strings.TrimSpace(v)))
+	tag := "•••• " + hex.EncodeToString(mac.Sum(nil))[:6]
+	if !found {
+		return tag
+	}
+	return k + ": " + tag
 }

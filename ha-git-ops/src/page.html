@@ -1,0 +1,924 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HA GitOps</title>
+<style>
+:root {
+  --bg:#f5f6f8; --card:#ffffff; --text:#1c2733; --muted:#5b6875; --border:#e3e6ea;
+  --code-bg:#f0f2f5; --diff-bg:#fbfcfd;
+  --primary:#0277bd; --primary-text:#ffffff; --primary-press:#01639f;
+  --base:#4a5562; --base-bg:#eceef1; --base-sw:#8a95a1;
+  --live:#9a4a00; --live-bg:#fdecd9; --live-sw:#e8892b;
+  --target:#0b5cad; --target-bg:#e2effc; --target-sw:#2f86d8;
+  --both:#b42318; --both-bg:#fde9e7;
+  --ok:#1e7e34; --ok-bg:#e5f3e8;
+  --warn:#7a5000; --warn-bg:#fdf1d2;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg:#111417; --card:#1c2126; --text:#e3e6ea; --muted:#a3adb7; --border:#2d353d;
+    --code-bg:#14181c; --diff-bg:#171c21;
+    --primary:#29b6f6; --primary-text:#0b1216; --primary-press:#4fc3f7;
+    --base:#c3cad2; --base-bg:rgba(255,255,255,.07); --base-sw:#7d8792;
+    --live:#ffb870; --live-bg:rgba(255,152,0,.15); --live-sw:#f0a04b;
+    --target:#8cc8ff; --target-bg:rgba(56,139,253,.17); --target-sw:#58a6ff;
+    --both:#ff9b8f; --both-bg:rgba(244,67,54,.16);
+    --ok:#7bc88a; --ok-bg:rgba(76,175,80,.16);
+    --warn:#ffca6a; --warn-bg:rgba(255,152,0,.14);
+  }
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text); line-height: 1.5;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+button { font: inherit; }
+.shell {
+  max-width: 90rem; margin: 0 auto; padding: 20px 16px 48px;
+  display: flex; flex-wrap: wrap; gap: 16px; align-items: flex-start;
+}
+.content { flex: 999 1 600px; min-width: 0; display: flex; flex-direction: column; gap: 14px; }
+
+.topbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+.brand { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.brand svg { color: var(--primary); flex: none; }
+h1 { font-size: 19px; margin: 0; font-weight: 650; }
+.muted { color: var(--muted); font-size: 14px; }
+
+.btn {
+  font: 600 14px system-ui, sans-serif; border: 1px solid var(--border);
+  background: var(--card); color: var(--text); border-radius: 8px; padding: 0 14px;
+  min-height: 44px; cursor: pointer; display: inline-flex; align-items: center;
+  justify-content: center; gap: 8px;
+}
+.btn:hover { border-color: var(--muted); }
+.btn.primary { background: var(--primary); color: var(--primary-text); border-color: transparent; }
+.btn.primary:hover { background: var(--primary-press); }
+.btn[disabled] { opacity: .5; cursor: default; }
+button:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
+
+.pill { display: inline-flex; align-items: center; border-radius: 999px; padding: 2px 10px; font-weight: 650; font-size: 12.5px; white-space: nowrap; }
+.p-warn { color: var(--warn); background: var(--warn-bg); }
+.p-ok { color: var(--ok); background: var(--ok-bg); }
+.p-bad { color: var(--both); background: var(--both-bg); white-space: normal; }
+
+.banner { border-radius: 10px; padding: 10px 14px; font-size: 14px; font-weight: 550; margin: 0; }
+.banner.warn { background: var(--warn-bg); color: var(--warn); }
+.banner.bad { background: var(--both-bg); color: var(--both); }
+.banner.ok { background: var(--ok-bg); color: var(--ok); }
+
+.filters { display: flex; gap: 8px; flex-wrap: wrap; }
+.fchip {
+  min-height: 40px; border-radius: 999px; border: 1px solid var(--border); background: var(--card);
+  color: var(--muted); font: 600 13px system-ui, sans-serif; padding: 0 14px;
+  display: inline-flex; gap: 8px; align-items: center; cursor: pointer;
+}
+.fchip[aria-pressed="true"] { color: var(--text); border-color: var(--text); }
+.fchip .n { background: var(--code-bg); border-radius: 999px; padding: 0 7px; font-size: 12px; }
+
+.vers { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+@media (max-width: 720px) { .vers { grid-template-columns: minmax(0, 1fr); } }
+.ver {
+  text-align: left; color: var(--text); cursor: pointer; border: 1px dashed var(--border);
+  background: transparent; border-radius: 12px; padding: 10px 14px; display: flex; gap: 10px;
+  align-items: flex-start; min-height: 44px;
+}
+.ver[aria-pressed="true"] { border-style: solid; background: var(--card); }
+.ver[aria-pressed="false"] .vtext { opacity: .7; }
+.ver[disabled] { cursor: default; }
+.sw { width: 10px; height: 10px; border-radius: 3px; margin-top: 6px; flex: none; }
+.sw.base { background: var(--base-sw); }
+.sw.live { background: var(--live-sw); }
+.sw.target { background: var(--target-sw); }
+.vtop { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.vn { font-weight: 650; font-size: 14px; }
+.vstate { font-size: 11.5px; font-weight: 650; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 0 7px; }
+.vbuf { font-size: 11.5px; font-weight: 650; color: var(--primary); }
+.vd { display: block; color: var(--muted); font-size: 13px; }
+.vd code { font-size: 12px; background: var(--code-bg); color: var(--text); padding: 1px 5px; border-radius: 4px; }
+.hint { margin: 0; color: var(--muted); font-size: 13px; }
+
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+.fh { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 14px; }
+.path { font-weight: 650; font-size: 14.5px; }
+.since { color: var(--muted); font-size: 13px; }
+.k-live { color: var(--live); background: var(--live-bg); }
+.k-target { color: var(--target); background: var(--target-bg); }
+.k-both { color: var(--both); background: var(--both-bg); }
+.s-base { color: var(--base); background: var(--base-bg); }
+.s-live { color: var(--live); background: var(--live-bg); }
+.s-target { color: var(--target); background: var(--target-bg); }
+.note { margin: 0; padding: 8px 14px; border-top: 1px solid var(--border); font-size: 13.5px; color: var(--muted); }
+
+.scroll { overflow-x: auto; background: var(--diff-bg); border-top: 1px solid var(--border); }
+.grid { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; line-height: 1.6; padding-bottom: 6px; }
+.grid.n2 { min-width: 580px; }
+.grid.n3 { min-width: 860px; }
+.row { display: grid; }
+.row.names { border-bottom: 1px solid var(--border); background: var(--card); font-family: system-ui, sans-serif; font-size: 12.5px; font-weight: 650; }
+.nm { padding: 6px 12px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.nm code { font-weight: 500; font-size: 12px; }
+.nm .bufn { font-weight: 500; font-size: 11.5px; color: var(--primary); }
+.nm.base { color: var(--base); }
+.nm.live { color: var(--live); }
+.nm.target { color: var(--target); }
+
+.c { display: flex; gap: 10px; padding: 0 10px; min-height: 1.6em; min-width: 0; }
+.c .tx { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; }
+.no { width: 3.4ch; flex: none; text-align: right; color: var(--muted); background: none; border: 0; padding: 0; font: inherit; user-select: none; }
+button.no { cursor: pointer; }
+button.no:hover { text-decoration: underline dotted; }
+button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
+.c.base { color: var(--base); background: var(--base-bg); }
+.c.live { color: var(--live); background: var(--live-bg); }
+.c.target { color: var(--target); background: var(--target-bg); }
+.c.gap { background: var(--code-bg); }
+.c.sel { box-shadow: inset 3px 0 0 var(--primary); }
+.c.stc { padding: 1px 6px 1px 10px; }
+.stack { display: flex; flex-direction: column; gap: 2px; flex: 1; min-width: 0; }
+.ol, .sl { display: flex; gap: 10px; min-width: 0; }
+.ol { color: var(--muted); }
+.ol .tx { text-decoration: line-through; text-decoration-thickness: 1px; }
+.sl { border-radius: 3px; margin-left: -4px; padding: 0 4px; font-style: italic; }
+.sl .no { font-style: normal; font-weight: 700; color: inherit; }
+.c.rb { position: relative; margin: 0 4px; border-left: 1px dashed; border-right: 1px dashed; }
+.c.rb-first { border-top: 1px dashed; border-top-left-radius: 6px; border-top-right-radius: 6px; margin-top: 4px; }
+.c.rb-last { border-bottom: 1px dashed; border-bottom-left-radius: 6px; border-bottom-right-radius: 6px; margin-bottom: 4px; }
+.c.rb-base { border-color: var(--base-sw); }
+.c.rb-live { border-color: var(--live-sw); }
+.c.rb-target { border-color: var(--target-sw); }
+.undo {
+  position: absolute; top: -10px; right: 8px; z-index: 1; width: 22px; height: 18px;
+  border-radius: 4px; border: 0; background: var(--diff-bg); display: inline-flex;
+  align-items: center; justify-content: center; cursor: pointer; padding: 0;
+}
+.undo:hover { background: var(--code-bg); }
+.a-base { color: var(--base); }
+.a-live { color: var(--live); }
+.a-target { color: var(--target); }
+
+.row.head { padding-top: 8px; }
+.hd { padding: 2px 12px 4px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; font-family: system-ui, sans-serif; }
+.tag { font-family: system-ui, sans-serif; font-weight: 650; font-size: 11.5px; border-radius: 999px; padding: 0 8px; line-height: 1.8; white-space: nowrap; }
+.st-chip { font-size: 11.5px; font-weight: 650; color: var(--muted); }
+.linkbtn { font: 600 12px system-ui, sans-serif; color: var(--primary); background: none; border: 1px solid transparent; border-radius: 6px; padding: 0 8px; min-height: 30px; cursor: pointer; }
+.linkbtn:hover { border-color: var(--border); }
+.fold { grid-column: 1 / -1; display: flex; }
+.fold button {
+  flex: 1; text-align: left; border: 0; background: var(--code-bg); color: var(--muted);
+  font: italic 12.5px system-ui, sans-serif; padding: 4px 12px; cursor: pointer;
+}
+.fold button:hover { color: var(--text); }
+
+.g { position: relative; min-height: 1.6em; }
+.bar { position: absolute; top: 0; bottom: 0; width: 2px; border-radius: 1px; }
+.bar-l { left: 6px; }
+.bar-r { right: 6px; }
+.bar.cap-t { top: 5px; }
+.bar.cap-b { bottom: 5px; }
+.bar.a-base { background: var(--base-sw); }
+.bar.a-live { background: var(--live-sw); }
+.bar.a-target { background: var(--target-sw); }
+.arr2 {
+  position: absolute; top: 1px; z-index: 1; width: 22px; height: 20px; border-radius: 4px;
+  border: 0; background: transparent; display: inline-flex; align-items: center;
+  justify-content: center; padding: 0; cursor: pointer;
+}
+.arr2:hover { background: var(--code-bg); }
+.arr2.arr-r { left: 9px; }
+.arr2.arr-l { right: 9px; }
+
+.empty { text-align: center; color: var(--muted); padding: 3.5rem 1rem; }
+.empty .lead { color: var(--text); font-weight: 600; font-size: 1.05rem; margin: .2rem 0; }
+
+.side { flex: 1 1 320px; min-width: 0; background: var(--card); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+.sidehead { font-size: 11.5px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); padding: 12px 14px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; }
+.sec { border-bottom: 1px solid var(--border); padding: 12px 14px; display: flex; flex-direction: column; gap: 8px; }
+.sec:last-child { border-bottom: 0; }
+.sech { display: flex; align-items: center; gap: 8px; font-weight: 650; font-size: 13.5px; }
+.sech .sw { margin-top: 0; }
+.sech .dir { color: var(--muted); font-weight: 500; font-size: 12px; margin-left: auto; white-space: nowrap; }
+.badge { background: var(--code-bg); border-radius: 999px; padding: 0 7px; font-size: 12px; font-weight: 650; }
+.msg { font: 14px system-ui, sans-serif; border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; background: var(--card); color: var(--text); resize: vertical; min-height: 60px; width: 100%; }
+.msg::placeholder { color: var(--muted); }
+.msg:focus { outline: 2px solid var(--primary); outline-offset: 1px; border-color: transparent; }
+.sec .empty-hint { margin: 0; color: var(--muted); font-size: 12.5px; }
+.tf { display: flex; align-items: center; gap: 6px; font-size: 13px; min-height: 30px; }
+.tf svg { color: var(--muted); flex: none; }
+.tf .fn { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-weight: 600; flex: 1; min-width: 0; overflow-wrap: anywhere; background: none; border: 0; padding: 0; color: var(--text); text-align: left; cursor: pointer; font-size: 13px; }
+.th { display: flex; align-items: center; gap: 6px; padding-left: 22px; font-size: 12.5px; min-height: 36px; flex-wrap: wrap; }
+.th .hl { flex: 1; min-width: 0; color: var(--muted); }
+.x { width: 36px; height: 36px; flex: none; border-radius: 6px; border: 1px solid transparent; background: transparent; color: var(--muted); display: inline-flex; align-items: center; justify-content: center; cursor: pointer; padding: 0; }
+.x:hover { border-color: var(--border); color: var(--text); }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+</style>
+</head>
+<body>
+<div class="shell">
+  <main class="content" id="main" aria-live="polite"><p class="muted">Loading…</p></main>
+  <aside class="side" id="side" aria-label="Staged buffers"></aside>
+</div>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- model ----------
+
+  // Columns in display order. Rows from the server are [base, live,
+  // target] with null where a version has no such line.
+  var VERS = [
+    { key: 'base', i: 0, name: 'last-applied' },
+    { key: 'live', i: 1, name: 'live' },
+    { key: 'target', i: 2, name: 'target' }
+  ];
+  var VER = { base: VERS[0], live: VERS[1], target: VERS[2] };
+  var KIND = {
+    both: { label: 'both changed', cls: 'k-both' },
+    live: { label: 'live changed', cls: 'k-live' },
+    target: { label: 'target changed', cls: 'k-target' }
+  };
+  // Live and target are buffers: per line, their own content or a line
+  // picked from another version. Last-applied is never written. Promote
+  // only takes applied live content, so a staged live line must be
+  // applied before it can be promoted; the target buffer therefore only
+  // ever holds content live already has.
+  var OPS = {
+    revert: { into: 'live', from: 'base', verb: 'Stage last-applied into live' },
+    apply: { into: 'live', from: 'target', verb: 'Stage target into live' },
+    promote: { into: 'target', from: 'live', block: 'live', verb: 'Stage live into target' }
+  };
+  var CTX = 3;
+
+  function load(k, d) {
+    try { var v = JSON.parse(localStorage.getItem('gitops.' + k)); return v || d; } catch (e) { return d; }
+  }
+  function save(k, v) {
+    try { localStorage.setItem('gitops.' + k, JSON.stringify(v)); } catch (e) { /* per-viewer nicety only */ }
+  }
+
+  var S = {
+    data: null,
+    files: [],
+    show: load('show', { base: false, live: true, target: true }),
+    filter: 'all',
+    buf: {},      // rel -> { token, live: {row: src}, target: {row: src} }
+    sel: {},      // rel -> { row: true }
+    anchor: null, // last clicked line, for shift-click ranges
+    open: {},     // expanded folds
+    busy: '',
+    notice: null  // { text, bad }
+  };
+  if (['base', 'live', 'target'].filter(function (k) { return S.show[k]; }).length < 2) {
+    S.show = { base: false, live: true, target: true };
+  }
+
+  function prepare(af) {
+    var n = [0, 0, 0];
+    var rows = af.rows.map(function (v, i) {
+      return { i: i, v: v, no: v.map(function (x, c) { return x === null ? '' : String(++n[c]); }) };
+    });
+    return Object.assign({}, af, { rows: rows });
+  }
+
+  function bufOf(f) {
+    var b = S.buf[f.rel];
+    if (!b) { b = S.buf[f.rel] = { token: f.token, live: {}, target: {} }; }
+    return b;
+  }
+  function staged(f, r, key) {
+    return key !== 'base' && !!(S.buf[f.rel] && S.buf[f.rel][key][r.i]);
+  }
+  // What a column shows: its buffer content for live and target.
+  function value(f, r, key) {
+    var src = key === 'base' ? null : S.buf[f.rel] && S.buf[f.rel][key][r.i];
+    return r.v[VER[src || key].i];
+  }
+  // What an op copies: the target buffer for apply, original content
+  // otherwise (promote reads applied live only; last-applied is fixed).
+  function source(f, r, op) {
+    return op.from === 'target' ? value(f, r, 'target') : r.v[VER[op.from].i];
+  }
+  function eligible(f, r, op) {
+    return value(f, r, op.into) !== source(f, r, op) && !(op.block && staged(f, r, op.block));
+  }
+  function picked(f, r) { return !!(S.sel[f.rel] && S.sel[f.rel][r.i]); }
+
+  function stageRows(f, op, rows) {
+    var b = bufOf(f);
+    rows.forEach(function (r) {
+      // Copying a line back to the buffer's own content is an unstage —
+      // e.g. applying a target line that was itself promoted from live.
+      if (source(f, r, op) === r.v[VER[op.into].i]) delete b[op.into][r.i];
+      else b[op.into][r.i] = op.from;
+    });
+    delete S.sel[f.rel];
+    render();
+  }
+  function unstageRows(f, rows, keys) {
+    var b = bufOf(f);
+    rows.forEach(function (r) { keys.forEach(function (k) { delete b[k][r.i]; }); });
+    render();
+  }
+
+  function lineCount(rows) { return rows.length; }
+  function plural(n, w) { return n + ' ' + w + (n === 1 ? '' : 's'); }
+  function rangeLabel(rows, col) {
+    var nums = rows.map(function (r) { return r.no[col] || r.no[0] || r.no[2] || r.no[1]; }).filter(Boolean);
+    if (!nums.length) return plural(rows.length, 'line');
+    var span = nums[0] === nums[nums.length - 1] ? 'line ' + nums[0] : 'lines ' + nums[0] + '–' + nums[nums.length - 1];
+    return rows.length > 1 && rows.length !== nums.length ? span + ' · ' + plural(rows.length, 'line') : span;
+  }
+
+  // Runs of consecutive staged lines from one source in a buffer column.
+  // Rows where the column has no line either way don't break a run.
+  function runsIn(f, key, rows) {
+    var runs = [], cur = null, pending = [];
+    rows.forEach(function (r) {
+      var src = S.buf[f.rel] && S.buf[f.rel][key][r.i];
+      if (!src && r.v[VER[key].i] === null) { if (cur) pending.push(r); return; }
+      if (!src) { cur = null; pending = []; return; }
+      if (cur && cur.src === src) { cur.span = cur.span.concat(pending, [r]); cur.rows.push(r); pending = []; return; }
+      cur = { src: src, rows: [r], span: [r] };
+      pending = [];
+      runs.push(cur);
+    });
+    return runs;
+  }
+
+  // ---------- reconciling buffers with fresh state ----------
+
+  function compose(f, key, picks) {
+    var own = VER[key].i, out = [];
+    f.rows.forEach(function (r) {
+      var v = r.v[picks[r.i] ? VER[picks[r.i]].i : own];
+      if (v !== null) out.push(v);
+    });
+    return out;
+  }
+
+  // Re-derive picks on new rows that reproduce the same buffer content,
+  // or null when the content can't be rebuilt from the allowed sources.
+  function restage(f, key, desired) {
+    var own = VER[key].i;
+    var srcs = key === 'live' ? ['base', 'target'] : ['live'];
+    var picks = {}, j = 0;
+    for (var k = 0; k < f.rows.length; k++) {
+      var r = f.rows[k], want = desired[j], ownV = r.v[own], hit = null;
+      if (ownV !== null && ownV === want) { j++; continue; }
+      for (var s = 0; s < srcs.length && hit === null; s++) {
+        if (r.v[VER[srcs[s]].i] !== null && r.v[VER[srcs[s]].i] === want) hit = srcs[s];
+      }
+      if (hit !== null) { picks[r.i] = hit; j++; continue; }
+      if (ownV === null) continue;
+      for (s = 0; s < srcs.length && hit === null; s++) {
+        if (r.v[VER[srcs[s]].i] === null) hit = srcs[s];
+      }
+      if (hit === null) return null;
+      picks[r.i] = hit;
+    }
+    return j === desired.length ? picks : null;
+  }
+
+  // ingest takes fresh state, keeping staging for unchanged files and
+  // rebuilding it on changed ones. done names a buffer just written for
+  // the given files; its staging is dropped instead.
+  function ingest(data, done) {
+    var old = {};
+    S.files.forEach(function (f) { old[f.rel] = f; });
+    S.data = data;
+    S.files = data.files.map(prepare);
+    var buf = {}, lost = [];
+    S.files.forEach(function (f) {
+      var b = S.buf[f.rel], of = old[f.rel];
+      if (!b || !of) return;
+      if (b.token === f.token && !(done && done.rels.indexOf(f.rel) >= 0)) { buf[f.rel] = b; return; }
+      var nb = { token: f.token, live: {}, target: {} };
+      ['live', 'target'].forEach(function (key) {
+        if (!Object.keys(b[key]).length) return;
+        if (done && done.key === key && done.rels.indexOf(f.rel) >= 0) return;
+        if (b.token === f.token) { nb[key] = b[key]; return; }
+        var p = restage(f, key, compose(of, key, b[key]));
+        if (p) nb[key] = p; else lost.push(f.rel + ' (' + key + ')');
+      });
+      buf[f.rel] = nb;
+      delete S.sel[f.rel];
+    });
+    Object.keys(S.sel).forEach(function (rel) { if (!buf[rel] && !S.files.some(function (f) { return f.rel === rel; })) delete S.sel[rel]; });
+    S.buf = buf;
+    if (lost.length) {
+      S.notice = { bad: true, text: 'Staging cleared for ' + lost.join(', ') + ': the file changed and the staged lines no longer fit. Stage them again.' };
+    }
+  }
+
+  // ---------- server ----------
+
+  function request(method, url, body) {
+    return fetch(url, {
+      method: method,
+      headers: body ? { 'Content-Type': 'application/json' } : {},
+      body: body ? JSON.stringify(body) : undefined,
+      cache: 'no-store'
+    }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (json) {
+        if (!res.ok) {
+          var err = new Error(json.error || res.status + ' ' + res.statusText);
+          err.state = json.state;
+          throw err;
+        }
+        return json;
+      });
+    });
+  }
+
+  function act(label, method, url, body, done, okText, onOk) {
+    if (S.busy) return;
+    S.busy = label;
+    S.notice = null;
+    render();
+    request(method, url, body).then(function (data) {
+      ingest(data, done);
+      if (onOk) onOk();
+      if (okText && !(S.notice && S.notice.bad)) S.notice = { text: okText };
+    }).catch(function (err) {
+      if (err.state) ingest(err.state, null);
+      S.notice = { bad: true, text: err.message };
+    }).then(function () {
+      S.busy = '';
+      render();
+    });
+  }
+
+  function stagedFiles(key) {
+    return S.files.filter(function (f) {
+      return S.buf[f.rel] && Object.keys(S.buf[f.rel][key]).length;
+    }).map(function (f) {
+      return { rel: f.rel, token: S.buf[f.rel].token, rows: S.buf[f.rel][key] };
+    });
+  }
+
+  function doApply() {
+    var files = stagedFiles('live');
+    act('Applying to live…', 'POST', 'api/apply', { files: files },
+      { key: 'live', rels: files.map(function (f) { return f.rel; }) },
+      'Applied ' + plural(files.length, 'file') + ' to live.');
+  }
+  function doCommit() {
+    var files = stagedFiles('target');
+    act('Committing…', 'POST', 'api/commit', { message: msgBox.value.trim(), files: files },
+      { key: 'target', rels: files.map(function (f) { return f.rel; }) },
+      'Committed and pushed ' + plural(files.length, 'file') + '.',
+      function () { msgBox.value = ''; });
+  }
+  function doRefresh() { act('Refreshing…', 'POST', 'api/refresh', null, null, null); }
+
+  // Pick up background refreshes; staging is rebuilt on changed files.
+  setInterval(function () {
+    if (S.busy || document.hidden) return;
+    request('GET', 'api/state').then(function (data) {
+      if (!S.busy && JSON.stringify(data) !== JSON.stringify(S.data)) { ingest(data, null); render(); }
+    }).catch(function () { /* next poll */ });
+  }, 30000);
+
+  // ---------- DOM helpers ----------
+
+  function h(tag, attrs) {
+    var el = document.createElement(tag);
+    if (attrs) {
+      Object.keys(attrs).forEach(function (k) {
+        var v = attrs[k];
+        if (v === null || v === undefined || v === false) return;
+        if (k === 'class') el.className = v;
+        else if (k === 'text') el.textContent = v;
+        else if (k === 'style') el.setAttribute('style', v);
+        else if (k.slice(0, 2) === 'on') el.addEventListener(k.slice(2), v);
+        else el.setAttribute(k, v === true ? '' : v);
+      });
+    }
+    for (var i = 2; i < arguments.length; i++) add(el, arguments[i]);
+    return el;
+  }
+  // add appends children, flattening nested arrays and skipping blanks.
+  function add(el, c) {
+    if (c === null || c === undefined || c === false) return;
+    if (Array.isArray(c)) { c.forEach(function (x) { add(el, x); }); return; }
+    el.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+  }
+  function fill(el, children) { el.replaceChildren(); add(el, children); }
+  var SVGNS = 'http://www.w3.org/2000/svg';
+  function svg(w, h2, vb, shapes) {
+    var el = document.createElementNS(SVGNS, 'svg');
+    el.setAttribute('width', w); el.setAttribute('height', h2); el.setAttribute('viewBox', vb);
+    el.setAttribute('fill', 'none'); el.setAttribute('stroke', 'currentColor'); el.setAttribute('stroke-width', '2');
+    el.setAttribute('stroke-linecap', 'round'); el.setAttribute('stroke-linejoin', 'round'); el.setAttribute('aria-hidden', 'true');
+    shapes.forEach(function (s) {
+      var n = document.createElementNS(SVGNS, s[0]);
+      Object.keys(s[1]).forEach(function (k) { n.setAttribute(k, s[1][k]); });
+      el.appendChild(n);
+    });
+    return el;
+  }
+  var ICON = {
+    right: function () { return svg(14, 12, '0 0 14 12', [['line', { x1: 1, y1: 6, x2: 12, y2: 6 }], ['polyline', { points: '8 2 12 6 8 10' }]]); },
+    left: function () { return svg(14, 12, '0 0 14 12', [['line', { x1: 13, y1: 6, x2: 2, y2: 6 }], ['polyline', { points: '6 2 2 6 6 10' }]]); },
+    undo: function () { return svg(13, 13, '0 0 16 16', [['path', { d: 'M3 13h7a3.5 3.5 0 0 0 0-7H4' }], ['polyline', { points: '7 3 4 6 7 9' }]]); },
+    file: function () { return svg(14, 14, '0 0 24 24', [['path', { d: 'M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z' }], ['polyline', { points: '14 2 14 8 20 8' }]]); },
+    minus: function () { return svg(14, 14, '0 0 24 24', [['line', { x1: 5, y1: 12, x2: 19, y2: 12 }]]); },
+    refresh: function () { return svg(16, 16, '0 0 24 24', [['path', { d: 'M21 12a9 9 0 1 1-2.64-6.36' }], ['polyline', { points: '21 3 21 9 15 9' }]]); },
+    brand: function () { return svg(22, 22, '0 0 24 24', [['line', { x1: 6, y1: 3, x2: 6, y2: 15 }], ['circle', { cx: 18, cy: 6, r: 3 }], ['circle', { cx: 6, cy: 18, r: 3 }], ['path', { d: 'M18 9a9 9 0 0 1-9 9' }]]); }
+  };
+  function short(sha) { return sha ? sha.slice(0, 7) : '—'; }
+
+  // ---------- rendering: diff ----------
+
+  function shownVers() { return VERS.filter(function (v) { return S.show[v.key]; }); }
+
+  // cells lays out one grid row: a column per shown version with a
+  // gutter between each adjacent pair.
+  function cells(shown, colFor, gutFor) {
+    var out = [];
+    shown.forEach(function (v, j) {
+      out.push(colFor(v, j));
+      if (j < shown.length - 1) out.push(gutFor(v, shown[j + 1]));
+    });
+    return out;
+  }
+  function gridStyle(n) {
+    return 'grid-template-columns:' + (n === 3
+      ? 'minmax(0,1fr) 64px minmax(0,1fr) 64px minmax(0,1fr)'
+      : 'minmax(0,1fr) 64px minmax(0,1fr)');
+  }
+
+  function clickLine(f, r, ev) {
+    var set = S.sel[f.rel] = S.sel[f.rel] || {};
+    if (ev.shiftKey && S.anchor && S.anchor.rel === f.rel) {
+      var a = Math.min(S.anchor.i, r.i), z = Math.max(S.anchor.i, r.i);
+      for (var i = a; i <= z; i++) set[i] = true;
+    } else if (set[r.i]) {
+      delete set[r.i];
+    } else {
+      set[r.i] = true;
+    }
+    S.anchor = { rel: f.rel, i: r.i };
+    render();
+  }
+
+  function numberEl(f, r, v, n, label) {
+    if (!label) return h('span', { class: 'no', text: n });
+    return h('button', {
+      type: 'button', class: 'no', 'aria-pressed': String(picked(f, r)), 'aria-label': label,
+      onclick: function (ev) { clickLine(f, r, ev); }
+    }, n);
+  }
+
+  function buildFile(f, shown) {
+    var differs = function (r) {
+      return shown.some(function (v) { return value(f, r, v.key) !== value(f, r, shown[0].key); });
+    };
+    var interesting = function (r) {
+      return differs(r) || shown.some(function (v) { return staged(f, r, v.key); });
+    };
+    var exists = function (r) {
+      return shown.some(function (v) { return value(f, r, v.key) !== null || staged(f, r, v.key); });
+    };
+    var vrows = f.rows.filter(exists);
+    var hot = vrows.map(interesting);
+    var spans = [];
+    hot.forEach(function (on, k) {
+      if (!on) return;
+      var last = spans[spans.length - 1];
+      if (last && k - last.z <= 2 * CTX + 1) last.z = k;
+      else spans.push({ a: k, z: k });
+    });
+    if (!spans.length) return null;
+
+    var hidden = VERS.filter(function (v) { return !S.show[v.key]; }).map(function (v) { return v.name; }).join(' and ');
+    var style = gridStyle(shown.length);
+    var rowsEl = [];
+    var foldRows = function (rows) {
+      if (!rows.length) return;
+      var id = f.rel + ':' + rows[0].i;
+      if (S.open[id]) { rows.forEach(function (r) { rowsEl.push(rowEl(f, shown, r, false, null, null, style)); }); return; }
+      var only = rows.filter(function (r) { return !(r.v[0] === r.v[1] && r.v[1] === r.v[2]); }).length;
+      var label = '⋯ ' + plural(rows.length, 'line') + (only ? ' · ' + only + ' differ only in ' + hidden + ' (hidden)' : ' unchanged');
+      rowsEl.push(h('div', { class: 'row', style: style }, h('div', { class: 'fold' },
+        h('button', { type: 'button', onclick: function () { S.open[id] = true; render(); } }, label + ' — show'))));
+    };
+
+    var pos = 0;
+    spans.forEach(function (sp) {
+      var a = Math.max(0, sp.a - CTX), z = Math.min(vrows.length - 1, sp.z + CTX);
+      foldRows(vrows.slice(pos, a));
+      var chunk = vrows.slice(a, z + 1);
+      pos = z + 1;
+      rowsEl.push(headEl(f, shown, chunk.filter(interesting), style));
+
+      // Staging arrows: per gutter and op, one segment per run of
+      // consecutive lines the op would change, split where line
+      // selection starts or ends.
+      var segAt = {};
+      for (var j = 0; j < shown.length - 1; j++) {
+        var A = shown[j], B = shown[j + 1];
+        var ops = A.key === 'base' && B.key === 'live' ? [['R', 'revert']]
+          : A.key === 'live' && B.key === 'target' ? [['R', 'promote'], ['L', 'apply']] : [];
+        ops.forEach(function (o) {
+          var op = OPS[o[1]], map = segAt[A.key + '|' + B.key + '|' + o[0]] = {}, cur = null, pending = [];
+          chunk.forEach(function (r) {
+            // A line neither side of the op has doesn't break its bar.
+            if (cur && value(f, r, op.into) === null && source(f, r, op) === null) { pending.push(r); return; }
+            if (!interesting(r) || !eligible(f, r, op)) { cur = null; pending = []; return; }
+            var p = picked(f, r);
+            if (!cur || cur.picked !== p) { cur = { op: op, picked: p, rows: [] }; pending = []; }
+            pending.forEach(function (x) { map[x.i] = cur; });
+            pending = [];
+            cur.rows.push(r);
+            map[r.i] = cur;
+          });
+        });
+      }
+      // Undo boxes: runs of staged lines per buffer column.
+      var boxAt = {};
+      shown.forEach(function (v) {
+        if (v.key === 'base') return;
+        boxAt[v.key] = {};
+        runsIn(f, v.key, chunk).forEach(function (run) {
+          run.span.forEach(function (r, k) { boxAt[v.key][r.i] = { run: run, first: k === 0, last: k === run.span.length - 1 }; });
+        });
+      });
+      chunk.forEach(function (r) { rowsEl.push(rowEl(f, shown, r, interesting(r) && differs(r), segAt, boxAt, style)); });
+    });
+    foldRows(vrows.slice(pos));
+
+    var notes = [];
+    if (f.absent[1] && S.show.live) notes.push(f.rel + ' does not exist in live; lines staged into live create it.');
+    if (f.absent[2] && S.show.target) notes.push(f.rel + ' is not in target; lines staged into target add it.');
+    if (f.masked) notes.push('Secret values are masked; matching tags mean matching values.');
+
+    var kind = KIND[f.kind];
+    return h('section', { class: 'card', id: 'file-' + f.rel, 'aria-label': f.rel },
+      h('div', { class: 'fh' },
+        h('code', { class: 'path', text: f.rel }),
+        h('span', { class: 'pill ' + kind.cls, text: kind.label })),
+      notes.map(function (t) { return h('p', { class: 'note', text: t }); }),
+      h('div', { class: 'scroll' }, h('div', { class: 'grid n' + shown.length },
+        h('div', { class: 'row names', style: style }, cells(shown, function (v) {
+          var n = S.buf[f.rel] ? Object.keys(S.buf[f.rel][v.key] || {}).length : 0;
+          return h('div', { class: 'nm ' + v.key }, v.name,
+            v.key === 'base' ? h('code', { text: short(f.baseSha) }) : v.key === 'target' ? h('code', { text: short(S.data.targetSha) }) : null,
+            n ? h('span', { class: 'bufn', text: 'buffer · ' + n + ' staged' }) : null);
+        }, function () { return h('div'); })),
+        rowsEl)));
+  }
+
+  function headEl(f, shown, hotRows, style) {
+    var live = false, target = false;
+    hotRows.forEach(function (r) { if (r.v[1] !== r.v[0]) live = true; if (r.v[2] !== r.v[0]) target = true; });
+    var kind = KIND[live && target ? 'both' : live ? 'live' : target ? 'target' : f.kind];
+    var inLive = hotRows.filter(function (r) { return staged(f, r, 'live'); }).length;
+    var inTarget = hotRows.filter(function (r) { return staged(f, r, 'target'); }).length;
+    var chip = [];
+    if (inLive) chip.push(inLive + ' staged into live');
+    if (inTarget) chip.push(inTarget + ' staged into target');
+    return h('div', { class: 'row head', style: style }, cells(shown, function (v, j) {
+      if (j > 0) return h('div');
+      return h('div', { class: 'hd' },
+        h('span', { class: 'tag ' + kind.cls, text: kind.label }),
+        chip.length ? h('span', { class: 'st-chip', text: chip.join(' · ') }) : null,
+        chip.length ? h('button', {
+          type: 'button', class: 'linkbtn', 'aria-label': 'Unstage all staged lines in this change of ' + f.rel,
+          onclick: function () { unstageRows(f, hotRows, ['live', 'target']); }
+        }, 'Unstage') : null);
+    }, function () { return h('div', { class: 'g' }); }));
+  }
+
+  function rowEl(f, shown, r, differs, segAt, boxAt, style) {
+    var isPicked = picked(f, r);
+    var text = function (val) { return val === null ? '' : val; };
+    var el = h('div', { class: 'row', style: style, 'data-rel': f.rel, 'data-i': String(r.i) }, cells(shown, function (v) {
+      var val = value(f, r, v.key);
+      var box = boxAt && boxAt[v.key] && boxAt[v.key][r.i];
+      var boxCls = box ? ' rb rb-' + box.run.src + (box.first ? ' rb-first' : '') + (box.last ? ' rb-last' : '') : '';
+      if (staged(f, r, v.key)) {
+        // Staged line in its buffer: the replaced line struck through,
+        // the incoming line tinted in its source version's colour.
+        var src = S.buf[f.rel][v.key][r.i], orig = r.v[v.i];
+        var undo = null;
+        if (box && box.first) {
+          var run = box.run;
+          var chosen = run.rows.filter(function (x) { return picked(f, x); });
+          var target = chosen.length ? chosen : run.rows;
+          var label = 'Undo staging ' + rangeLabel(target, v.i) + ' from ' + VER[run.src].name + ' into ' + v.name;
+          undo = h('button', {
+            type: 'button', class: 'undo a-' + run.src, 'aria-label': label, title: label,
+            onclick: function () { delete S.sel[f.rel]; unstageRows(f, target, [v.key]); }
+          }, ICON.undo());
+        }
+        return h('div', { class: 'c stc' + boxCls + (isPicked ? ' sel' : '') }, undo,
+          h('div', { class: 'stack' },
+            orig !== null ? h('div', { class: 'ol' }, h('span', { class: 'no', text: r.no[v.i] }),
+              h('span', { class: 'tx' }, h('span', { class: 'sr', text: 'replaced: ' }), orig)) : null,
+            val !== null ? h('div', { class: 'sl s-' + src },
+              numberEl(f, r, v, '+', 'Select staged line in ' + v.name),
+              h('span', { class: 'tx' }, h('span', { class: 'sr', text: 'staged: ' }), val)) : null));
+      }
+      var cls = '';
+      if (differs) {
+        if (val === null) cls = 'gap';
+        else if (shown[0].key === 'base') cls = v.key === 'base' ? 'base' : val !== r.v[0] ? v.key : '';
+        else cls = v.key;
+      }
+      cls += v.key !== 'base' ? boxCls : '';
+      if (isPicked) cls += ' sel';
+      var canPick = differs && val !== null;
+      return h('div', { class: 'c ' + cls },
+        numberEl(f, r, v, r.no[v.i], canPick ? 'Select line ' + r.no[v.i] + ' of ' + v.name : null),
+        h('span', { class: 'tx', text: text(val) }));
+    }, function (A, B) {
+      var g = h('div', { class: 'g' });
+      if (!segAt) return g;
+      [['R', 'bar-l', 'arr-r', ICON.right], ['L', 'bar-r', 'arr-l', ICON.left]].forEach(function (s) {
+        var map = segAt[A.key + '|' + B.key + '|' + s[0]];
+        var seg = map && map[r.i];
+        if (!seg) return;
+        var first = seg.rows[0] === r, last = seg.rows[seg.rows.length - 1] === r;
+        g.appendChild(h('div', { class: 'bar ' + s[1] + ' a-' + seg.op.from + (first ? ' cap-t' : '') + (last ? ' cap-b' : '') }));
+        if (!first) return;
+        var label = seg.op.verb + ' — ' + rangeLabel(seg.rows, VER[seg.op.into].i) + (seg.picked ? ' (selected)' : '');
+        g.appendChild(h('button', {
+          type: 'button', class: 'arr2 ' + s[2] + ' a-' + seg.op.from, 'aria-label': label, title: label,
+          onclick: function () { stageRows(f, seg.op, seg.rows); }
+        }, s[3]()));
+      });
+      return g;
+    }));
+    return el;
+  }
+
+  // ---------- rendering: page ----------
+
+  var msgBox = h('textarea', { id: 'commit-msg', class: 'msg', rows: '2', placeholder: 'Commit message' });
+
+  function render() {
+    var main = document.getElementById('main'), side = document.getElementById('side');
+    if (!S.data) return;
+    var d = S.data, shown = shownVers();
+    var count = function (k) { return S.files.filter(function (f) { return f.kind === k; }).length; };
+
+    var top = h('div', { class: 'topbar' },
+      h('div', { class: 'brand' }, ICON.brand(), h('h1', { text: 'HA GitOps' }),
+        d.error ? h('span', { class: 'pill p-bad', text: '✗ ' + d.error })
+          : S.files.length ? h('span', { class: 'pill p-warn', text: plural(S.files.length, 'file') + ' differ' })
+            : h('span', { class: 'pill p-ok', text: '✓ in sync' }),
+        h('span', { class: 'muted', text: 'refreshed ' + (d.lastSync || 'never') })),
+      h('button', { type: 'button', class: 'btn', disabled: !!S.busy, onclick: doRefresh }, ICON.refresh(), 'Refresh'));
+
+    var banners = [];
+    if (d.restartRequired) banners.push(h('p', { class: 'banner warn', text: 'Restart Home Assistant Core to activate the applied changes.' }));
+    if (S.busy) banners.push(h('p', { class: 'banner warn', text: S.busy }));
+    if (S.notice) banners.push(h('p', { class: 'banner ' + (S.notice.bad ? 'bad' : 'ok'), role: S.notice.bad ? 'alert' : null, text: S.notice.text }));
+
+    var body = [];
+    if (!S.files.length) {
+      body.push(h('div', { class: 'empty' }, h('p', { class: 'lead', text: 'Everything is in sync' }),
+        h('p', { text: 'Home Assistant matches git — nothing to apply or commit.' })));
+    } else {
+      body.push(h('div', { class: 'filters', role: 'group', 'aria-label': 'Filter files' },
+        [['all', 'All', S.files.length], ['both', 'both changed', count('both')], ['live', 'live changed', count('live')], ['target', 'target changed', count('target')]]
+          .map(function (c) {
+            return h('button', { type: 'button', class: 'fchip', 'aria-pressed': String(S.filter === c[0]), onclick: function () { S.filter = c[0]; render(); } },
+              c[1] + ' ', h('span', { class: 'n', text: String(c[2]) }));
+          })));
+      var desc = {
+        base: ['synced to HA · ', short(d.appliedSha) + (d.aheadBaselines ? ' (+' + plural(d.aheadBaselines, 'file') + ' newer)' : '')],
+        live: ['what Home Assistant runs now', null],
+        target: ['desired state · ' + d.branch + ' @ ', short(d.targetSha)]
+      };
+      body.push(h('div', { class: 'vers', role: 'group', 'aria-label': 'Versions to compare' }, VERS.map(function (v) {
+        var on = !!S.show[v.key], n = 0;
+        if (v.key !== 'base') Object.keys(S.buf).forEach(function (rel) { n += Object.keys(S.buf[rel][v.key]).length; });
+        return h('button', {
+          type: 'button', class: 'ver', 'aria-pressed': String(on), disabled: on && shown.length <= 2,
+          onclick: function () { S.show[v.key] = !on; save('show', S.show); render(); }
+        }, h('span', { class: 'sw ' + v.key }), h('span', { class: 'vtext' },
+          h('span', { class: 'vtop' }, h('span', { class: 'vn', text: v.name }), h('span', { class: 'vstate', text: on ? 'shown' : 'hidden' }),
+            n ? h('span', { class: 'vbuf', text: 'buffer · ' + plural(n, 'line') + ' staged' }) : null),
+          h('span', { class: 'vd' }, desc[v.key][0], desc[v.key][1] ? h('code', { text: desc[v.key][1] }) : null)));
+      })));
+      var hiddenNames = VERS.filter(function (v) { return !S.show[v.key]; }).map(function (v) { return v.name; }).join(' and ');
+      body.push(h('p', { class: 'hint', text: (shown.length === 3 ? 'Comparing all three versions.'
+        : 'Comparing ' + shown[0].name + ' with ' + shown[1].name + '; differences only in ' + hiddenNames + ' are folded away.') +
+        ' Arrows in the gutters stage the lines their bar spans; select lines (drag across text, or click line numbers) to split them. Staged lines are boxed in their source colour with an undo badge.' }));
+
+      var hiddenFiles = [];
+      S.files.forEach(function (f) {
+        if (S.filter !== 'all' && f.kind !== S.filter) return;
+        var card = buildFile(f, shown);
+        if (card) body.push(card); else hiddenFiles.push(f.rel);
+      });
+      if (hiddenFiles.length) {
+        body.push(h('p', { class: 'hint', text: hiddenFiles.join(', ') + (hiddenFiles.length === 1 ? ' differs' : ' differ') + ' only in ' + hiddenNames + ' (hidden).' }));
+      }
+    }
+    fill(main, [top, banners, body]);
+    renderSide(side);
+  }
+
+  function renderSide(side) {
+    var tree = function (key, withUnstage) {
+      var out = [];
+      S.files.forEach(function (f) {
+        var items = runsIn(f, key, f.rows).map(function (run) {
+          var label = 'Unstage ' + f.rel + ' ' + rangeLabel(run.rows, VER[key].i) + ' from ' + VER[run.src].name;
+          return h('div', { class: 'th' },
+            h('span', { class: 'hl', text: rangeLabel(run.rows, VER[key].i) }),
+            h('span', { class: 'tag s-' + run.src, text: 'from ' + VER[run.src].name }),
+            withUnstage ? h('button', { type: 'button', class: 'x', 'aria-label': label, title: label,
+              onclick: function () { unstageRows(f, run.rows, [key]); } }, ICON.minus()) : null);
+        });
+        if (items.length) out.push(fileRow(f, items.length), items);
+      });
+      return out;
+    };
+    var fileRow = function (f, n) {
+      return h('div', { class: 'tf' }, ICON.file(),
+        h('button', { type: 'button', class: 'fn', onclick: function () {
+          var el = document.getElementById('file-' + f.rel);
+          if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+        } }, f.rel),
+        h('span', { class: 'badge', text: String(n) }));
+    };
+    var total = function (key) {
+      var n = 0;
+      Object.keys(S.buf).forEach(function (rel) { n += Object.keys(S.buf[rel][key]).length; });
+      return n;
+    };
+    var nLive = total('live'), nTarget = total('target');
+
+    var unstaged = [], nUn = 0;
+    S.files.forEach(function (f) {
+      var runs = [], cur = null;
+      f.rows.forEach(function (r) {
+        var open = value(f, r, 'live') !== value(f, r, 'target') && !staged(f, r, 'live') && !staged(f, r, 'target');
+        if (!open) { cur = null; return; }
+        if (!cur) { cur = []; runs.push(cur); }
+        cur.push(r);
+      });
+      if (!runs.length) return;
+      nUn += runs.length;
+      unstaged.push(fileRow(f, runs.length), runs.map(function (rows) {
+        return h('div', { class: 'th' }, h('span', { class: 'hl', text: rangeLabel(rows, 1) }),
+          h('span', { class: 'tag ' + KIND[f.kind].cls, text: KIND[f.kind].label }));
+      }));
+    });
+
+    fill(side, [
+      h('div', { class: 'sidehead' }, h('span', { text: 'Staged buffers' }), h('span', { text: plural(nLive + nTarget, 'line') + ' staged' })),
+      h('section', { class: 'sec', 'aria-label': 'Live buffer' },
+        h('div', { class: 'sech' }, h('span', { class: 'sw live' }), h('span', { text: 'Live buffer' }),
+          h('span', { class: 'badge', text: String(nLive) }), h('span', { class: 'dir', text: '→ Home Assistant' })),
+        h('button', { type: 'button', class: 'btn' + (nLive ? ' primary' : ''), disabled: !nLive || !!S.busy, onclick: doApply },
+          nLive ? 'Apply ' + plural(nLive, 'line') + ' to live' : 'Apply to live'),
+        nLive ? null : h('p', { class: 'empty-hint', text: 'Nothing staged. Use |→ from last-applied or ←| from target.' }),
+        tree('live', true)),
+      h('section', { class: 'sec', 'aria-label': 'Target buffer' },
+        h('div', { class: 'sech' }, h('span', { class: 'sw target' }), h('span', { text: 'Target buffer' }),
+          h('span', { class: 'badge', text: String(nTarget) }), h('span', { class: 'dir', text: '→ ' + (S.data.branch || 'git') })),
+        h('label', { class: 'sr', for: 'commit-msg', text: 'Commit message' }), msgBox,
+        h('button', { type: 'button', class: 'btn' + (nTarget ? ' primary' : ''), disabled: !nTarget || !!S.busy, onclick: doCommit },
+          nTarget ? 'Commit & push ' + plural(nTarget, 'line') : 'Commit & push'),
+        nTarget ? null : h('p', { class: 'empty-hint', text: 'Nothing staged. Use |→ from live (applied lines only).' }),
+        tree('target', true)),
+      h('section', { class: 'sec', 'aria-label': 'Unstaged differences' },
+        h('div', { class: 'sech' }, h('span', { text: 'Unstaged differences' }), h('span', { class: 'badge', text: String(nUn) }),
+          h('span', { class: 'dir', text: 'live ≠ target' })),
+        unstaged)]);
+  }
+
+  // Text selection across diff rows selects those lines.
+  document.addEventListener('mouseup', function () {
+    var sel = window.getSelection();
+    if (!sel || sel.isCollapsed) return;
+    var main = document.getElementById('main');
+    if (!main.contains(sel.anchorNode)) return;
+    var any = false;
+    main.querySelectorAll('.row[data-rel]').forEach(function (el) {
+      if (!sel.containsNode(el, true)) return;
+      var rel = el.getAttribute('data-rel'), i = Number(el.getAttribute('data-i'));
+      var f = S.files.filter(function (x) { return x.rel === rel; })[0];
+      if (!f) return;
+      if (!any) { S.sel = {}; any = true; }
+      (S.sel[rel] = S.sel[rel] || {})[i] = true;
+    });
+    if (any) { sel.removeAllRanges(); render(); }
+  });
+
+  request('GET', 'api/state').then(function (data) { ingest(data, null); render(); }).catch(function (err) {
+    document.getElementById('main').replaceChildren(h('p', { class: 'banner bad', text: 'Could not load state: ' + err.message }));
+  });
+})();
+</script>
+</body>
+</html>

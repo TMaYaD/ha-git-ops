@@ -1,24 +1,29 @@
 package main
 
-// Reconciler state machine per managed file:
+// Every managed file has three versions:
 //
-//	in-sync    live == applied HEAD
-//	drift      live != applied HEAD and HEAD did not move (click-ops change)
-//	incoming   remote HEAD moved past the applied baseline; the change is
-//	           surfaced with a diff and written only on explicit apply
-//	conflict   HEAD moved AND live != previously-applied version
-//	           (both sides changed; never auto-resolved)
+//	last-applied  the git content HA was last in sync with (per file)
+//	live          what Home Assistant runs now
+//	target        the branch head, fetched
+//
+// A file needs a decision when live != target; it is "live changed",
+// "target changed" or "both changed" depending on which side moved away
+// from last-applied. The panel stages line-level picks into two buffers
+// — live (from last-applied or target) and target (from applied live
+// content) — and writes them only on an explicit apply or commit.
 //
 // Nothing is ever written sight unseen: the poll loop only fetches and
-// recomputes diffs. Apply only writes files whose live content still
-// matches the previously applied git version — local edits are never
-// stomped. On first run nothing is written: remote HEAD becomes the
-// baseline and every difference shows up as drift for the human to
-// promote or apply.
+// recomputes. Apply and commit carry a token of the three versions the
+// human reviewed and are refused if any of them changed since. On first
+// run nothing is written: remote HEAD becomes the baseline and every
+// difference shows up for the human to converge deliberately.
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -28,6 +33,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/TMaYaD/ha-git-ops/diff3"
 )
 
 const (
@@ -47,11 +54,34 @@ var reloadServices = map[string][2]string{
 	"scripts.yaml":     {"script", "reload"},
 }
 
+// File kinds: which side moved away from last-applied.
+const (
+	kindLive   = "live"
+	kindTarget = "target"
+	kindBoth   = "both"
+)
+
+var (
+	// ErrStale refuses a write built on versions that changed since the
+	// panel loaded them.
+	ErrStale = errors.New("changed since the panel loaded it — refresh and review again")
+	// ErrRolledBack reports an apply undone by a failed config check.
+	ErrRolledBack = errors.New("core config check failed; live files restored")
+)
+
+// FileState is one file that needs a decision.
+type FileState struct {
+	Rel                string
+	Kind               string
+	BaseSHA            string
+	Base, Live, Target []byte
+	Rows               []diff3.Row
+	Token              string
+}
+
 type Status struct {
-	Drift           map[string]string
-	Incoming        map[string]string
-	Conflicts       map[string]string
-	PendingSHA      string
+	Files           []FileState
+	TargetSHA       string
 	Error           string
 	RestartRequired bool
 	LastSync        string
@@ -59,6 +89,9 @@ type Status struct {
 
 type persistedState struct {
 	AppliedSHA string `json:"applied_sha"`
+	// Files that converged on a newer target while others still differ
+	// keep their own baseline until AppliedSHA catches up.
+	Baselines map[string]string `json:"baselines,omitempty"`
 }
 
 type Reconciler struct {
@@ -90,11 +123,6 @@ func NewReconciler(opts Options, ha *HA) *Reconciler {
 		ageKeyFile: "/data/age.key",
 		sshKeyFile: "/data/ssh/id_ed25519",
 		backupsDir: "/data/backups",
-		status: Status{
-			Drift:     map[string]string{},
-			Incoming:  map[string]string{},
-			Conflicts: map[string]string{},
-		},
 	}
 	if raw, err := os.ReadFile(r.stateFile); err == nil {
 		_ = json.Unmarshal(raw, &r.state)
@@ -102,29 +130,20 @@ func NewReconciler(opts Options, ha *HA) *Reconciler {
 	return r
 }
 
-// Snapshot returns a copy of the current status and applied SHA for the UI.
-func (r *Reconciler) Snapshot() (Status, string) {
+// Snapshot returns a copy of the current status, the applied SHA and how
+// many files carry their own newer baseline.
+func (r *Reconciler) Snapshot() (Status, string, int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	st := r.status
-	st.Drift = copyMap(r.status.Drift)
-	st.Incoming = copyMap(r.status.Incoming)
-	st.Conflicts = copyMap(r.status.Conflicts)
-	return st, r.state.AppliedSHA
+	st.Files = append([]FileState(nil), r.status.Files...)
+	return st, r.state.AppliedSHA, len(r.state.Baselines)
 }
 
 func (r *Reconciler) SetError(msg string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.status.Error = msg
-}
-
-func copyMap(m map[string]string) map[string]string {
-	out := make(map[string]string, len(m))
-	for k, v := range m {
-		out[k] = v
-	}
-	return out
 }
 
 func (r *Reconciler) saveState() error {
@@ -212,6 +231,21 @@ func (r *Reconciler) ensureRepo() error {
 		}
 	}
 	return nil
+}
+
+// fetchRemote fetches the branch and returns its head.
+func (r *Reconciler) fetchRemote() (string, error) {
+	if err := r.ensureRepo(); err != nil {
+		return "", err
+	}
+	if _, err := r.git("fetch", "origin", r.opts.Branch); err != nil {
+		return "", err
+	}
+	remote, err := r.git("rev-parse", "origin/"+r.opts.Branch)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(remote), nil
 }
 
 // atRef returns desired content at a git ref (nil if absent), in the
@@ -335,155 +369,292 @@ func (r *Reconciler) writeLive(rel string, content []byte) error {
 	return os.WriteFile(target, content, 0o644)
 }
 
-// ---------- reconcile ----------
-
-// Tick fetches upstream and recomputes incoming changes and drift. It
-// never writes to live HA — upstream commits wait as reviewable
-// incoming changes until an explicit ApplyUpstream.
-func (r *Reconciler) Tick() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.refreshLocked()
+// writeRepo stages content for rel in the repo worktree; nil removes it.
+// The secrets file is re-encrypted with the repo's .sops.yaml recipients
+// so the operator key can still decrypt; rules match by path.
+func (r *Reconciler) writeRepo(rel string, content []byte) error {
+	src := rel
+	if rel == secretsPlain {
+		src = secretsSops
+	}
+	gitPath := r.opts.Subfolder + "/" + src
+	if content == nil {
+		_, err := r.git("rm", "-q", "--ignore-unmatch", gitPath)
+		return err
+	}
+	out := filepath.Join(r.repoDir, r.opts.Subfolder, src)
+	if err := os.MkdirAll(filepath.Dir(out), 0o755); err != nil {
+		return err
+	}
+	if rel == secretsPlain {
+		if err := os.WriteFile(out, content, 0o600); err != nil {
+			return err
+		}
+		cmd := exec.Command("sops", "--encrypt", "--in-place", out)
+		cmd.Dir = r.repoDir
+		cmd.Env = append(os.Environ(), "HOME=/data")
+		if o, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("sops encrypt: %v: %s", err, o)
+		}
+	} else if err := os.WriteFile(out, content, 0o644); err != nil {
+		return err
+	}
+	_, err := r.git("add", gitPath)
+	return err
 }
 
-func (r *Reconciler) refreshLocked() error {
-	if err := r.ensureRepo(); err != nil {
-		return err
-	}
-	if _, err := r.git("fetch", "origin", r.opts.Branch); err != nil {
-		return err
-	}
-	remote, err := r.git("rev-parse", "origin/"+r.opts.Branch)
-	if err != nil {
-		return err
-	}
-	remote = strings.TrimSpace(remote)
+// ---------- three-way state ----------
 
-	if r.state.AppliedSHA == "" {
-		// First run: baseline only, write nothing. Differences appear as
-		// drift for the human to converge deliberately.
-		if _, err := r.git("reset", "--hard", remote); err != nil {
-			return err
-		}
-		r.state.AppliedSHA = remote
-		if err := r.saveState(); err != nil {
-			return err
-		}
-		log.Printf("baselined at %.9s without applying (first run)", remote)
-	}
-
-	if err := r.computeIncoming(remote); err != nil {
-		return err
-	}
-	if len(r.status.Incoming) == 0 && remote != r.state.AppliedSHA {
-		// Upstream moved but nothing user-visible would change (e.g. a
-		// sops re-encryption to the same plaintext, or commits already
-		// matching live): fast-forward the baseline without touching HA.
-		if _, err := r.git("reset", "--hard", remote); err != nil {
-			return err
-		}
-		r.state.AppliedSHA = remote
-		if err := r.saveState(); err != nil {
-			return err
-		}
-		r.status.PendingSHA = ""
-		log.Printf("fast-forwarded baseline to %.9s (no live changes)", remote)
-	}
-	if err := r.computeDrift(); err != nil {
-		return err
-	}
-	r.publish()
-	r.notifyDrift()
-	r.status.Error = ""
-	r.status.LastSync = time.Now().Format("2006-01-02 15:04:05")
-	return nil
+// same treats an absent file and an empty one as different.
+func same(a, b []byte) bool {
+	return (a == nil) == (b == nil) && bytes.Equal(a, b)
 }
 
-// computeIncoming diffs applied..remote into reviewable pending changes.
-// Nothing is written; the classification mirrors what apply would do.
-func (r *Reconciler) computeIncoming(remote string) error {
-	incoming := map[string]string{}
-	r.status.PendingSHA = ""
-	if remote != r.state.AppliedSHA {
-		rels, err := r.changedRels(r.state.AppliedSHA, remote)
+func (r *Reconciler) baselineFor(rel string) string {
+	if sha, ok := r.state.Baselines[rel]; ok {
+		return sha
+	}
+	return r.state.AppliedSHA
+}
+
+// token fingerprints the three versions a decision was made on.
+func token(vs ...[]byte) string {
+	h := sha256.New()
+	for _, v := range vs {
+		if v == nil {
+			h.Write([]byte{0})
+			continue
+		}
+		fmt.Fprintf(h, "\x01%d:", len(v))
+		h.Write(v)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:20]
+}
+
+func (r *Reconciler) fileState(rel, remote string) FileState {
+	baseSHA := r.baselineFor(rel)
+	b, l, t := r.atRef(baseSHA, rel), r.live(rel), r.atRef(remote, rel)
+	fs := FileState{Rel: rel, BaseSHA: baseSHA, Base: b, Live: l, Target: t}
+	if same(l, t) {
+		return fs
+	}
+	lc, tc := !same(l, b), !same(t, b)
+	switch {
+	case lc && tc:
+		fs.Kind = kindBoth
+	case lc:
+		fs.Kind = kindLive
+	default:
+		fs.Kind = kindTarget
+	}
+	fs.Rows = diff3.Align(diff3.Lines(b), diff3.Lines(l), diff3.Lines(t))
+	fs.Token = token(b, l, t)
+	return fs
+}
+
+// computeLocked rebuilds the per-file state against remote and advances
+// baselines: a file whose live content matches target is in sync at
+// remote, and once no file is behind remote AppliedSHA moves there too.
+func (r *Reconciler) computeLocked(remote string) error {
+	seen := map[string]bool{}
+	var rels []string
+	for _, ref := range []string{r.state.AppliedSHA, remote} {
+		rs, err := r.managedRels(ref)
 		if err != nil {
 			return err
 		}
-		for _, rel := range rels {
-			was := r.atRef(r.state.AppliedSHA, rel)
-			want := r.atRef(remote, rel)
-			liveB := r.live(rel)
-			switch {
-			case want == nil && liveB == nil:
-				// gone on both sides — nothing to apply
-			case liveB != nil && want != nil && bytes.Equal(liveB, want):
-				// live already matches the new version — nothing to apply
-			case liveB != nil && was != nil && !bytes.Equal(liveB, was):
-				incoming[rel] = "changed in both git and HA — apply will skip it"
-			case want == nil:
-				incoming[rel] = "deleted in git"
-			case was == nil:
-				incoming[rel] = "new in git"
-			default:
-				incoming[rel] = "updated in git"
-			}
-		}
-		r.status.PendingSHA = remote
-	}
-	r.status.Incoming = incoming
-	return nil
-}
-
-// changedRels parses old..new into live-named rel paths (renames become
-// a delete plus an add).
-func (r *Reconciler) changedRels(old, new_ string) ([]string, error) {
-	out, err := r.git("diff", "--name-status", old, new_, "--", r.opts.Subfolder)
-	if err != nil {
-		return nil, err
-	}
-	seen := map[string]bool{}
-	var rels []string
-	prefix := r.opts.Subfolder + "/"
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		if line == "" {
-			continue
-		}
-		fields := strings.Split(line, "\t")
-		for _, p := range fields[1:] { // status, path [, path for renames]
-			rel := strings.TrimPrefix(p, prefix)
-			if rel == secretsSops {
-				rel = secretsPlain
-			}
+		for _, rel := range rs {
 			if !seen[rel] {
 				seen[rel] = true
 				rels = append(rels, rel)
 			}
 		}
 	}
-	return rels, nil
+	for rel := range r.state.Baselines {
+		if !seen[rel] {
+			seen[rel] = true
+			rels = append(rels, rel)
+		}
+	}
+	sort.Strings(rels)
+
+	var files []FileState
+	dirty, behind := false, false
+	for _, rel := range rels {
+		fs := r.fileState(rel, remote)
+		if fs.Kind == "" {
+			if fs.BaseSHA != remote && !same(fs.Base, fs.Target) {
+				if r.state.Baselines == nil {
+					r.state.Baselines = map[string]string{}
+				}
+				r.state.Baselines[rel] = remote
+				dirty = true
+			}
+			continue
+		}
+		if fs.Kind != kindLive {
+			behind = true
+		}
+		files = append(files, fs)
+	}
+	if !behind && (r.state.AppliedSHA != remote || len(r.state.Baselines) > 0) {
+		// Nothing user-visible would change by moving the baseline (e.g. a
+		// sops re-encryption to the same plaintext, or commits live already
+		// matches): fast-forward without touching HA.
+		log.Printf("fast-forwarded baseline to %.9s", remote)
+		r.state.AppliedSHA = remote
+		r.state.Baselines = nil
+		dirty = true
+	}
+	if dirty {
+		if err := r.saveState(); err != nil {
+			return err
+		}
+	}
+	r.status.Files = files
+	r.status.TargetSHA = remote
+	return nil
 }
 
-func (r *Reconciler) apply(old, new_ string) error {
-	rels, err := r.changedRels(old, new_)
+// Tick fetches upstream and recomputes. It never writes to live HA —
+// upstream commits wait as reviewable target changes until an explicit
+// apply.
+func (r *Reconciler) Tick() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	remote, err := r.fetchRemote()
 	if err != nil {
 		return err
 	}
-	var applied []string
-	conflicts := map[string]string{}
-	backupDir := filepath.Join(r.backupsDir, time.Now().Format("20060102-150405"))
+	if r.state.AppliedSHA == "" {
+		// First run: baseline only, write nothing. Differences appear for
+		// the human to converge deliberately.
+		r.state.AppliedSHA = remote
+		if err := r.saveState(); err != nil {
+			return err
+		}
+		log.Printf("baselined at %.9s without applying (first run)", remote)
+	}
+	if err := r.computeLocked(remote); err != nil {
+		return err
+	}
+	r.status.Error = ""
+	r.finishLocked()
+	return nil
+}
 
+// finishLocked publishes the recomputed state.
+func (r *Reconciler) finishLocked() {
+	r.publish()
+	r.notifyDrift()
+	r.status.LastSync = time.Now().Format("2006-01-02 15:04:05")
+}
+
+func (r *Reconciler) RefreshNow() error { return r.Tick() }
+
+// ---------- writes ----------
+
+// Picks stages one file's buffer: row index → the column it takes.
+type Picks struct {
+	Rel   string
+	Token string
+	Rows  map[int]diff3.Col
+}
+
+// resolve rebuilds a file's current state and checks it is the one the
+// picks were made on. Only files the panel was shown can be written.
+func (r *Reconciler) resolve(p Picks, remote string, allowed ...diff3.Col) (FileState, error) {
+	known := false
+	for _, f := range r.status.Files {
+		if f.Rel == p.Rel {
+			known = true
+		}
+	}
+	if !known {
+		return FileState{}, fmt.Errorf("%s: %w", p.Rel, ErrStale)
+	}
+	fs := r.fileState(p.Rel, remote)
+	if fs.Token != p.Token {
+		return FileState{}, fmt.Errorf("%s: %w", p.Rel, ErrStale)
+	}
+	for i, c := range p.Rows {
+		ok := false
+		for _, a := range allowed {
+			ok = ok || c == a
+		}
+		if !ok || i < 0 || i >= len(fs.Rows) {
+			return FileState{}, fmt.Errorf("%s: invalid pick for row %d", p.Rel, i)
+		}
+	}
+	return fs, nil
+}
+
+// ApplyLive writes the staged live buffer: each file's live content with
+// the picked rows taken from last-applied or target.
+func (r *Reconciler) ApplyLive(picks []Picks) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	remote := r.status.TargetSHA
+	want := map[string][]byte{}
+	for _, p := range picks {
+		fs, err := r.resolve(p, remote, diff3.Base, diff3.Target)
+		if err != nil {
+			return err
+		}
+		want[p.Rel] = diff3.Compose(fs.Rows, diff3.Live, p.Rows)
+	}
+	applyErr := r.applyLocked(want)
+	if err := r.computeLocked(remote); err != nil {
+		return err
+	}
+	r.finishLocked()
+	return applyErr
+}
+
+// AutoApply applies target to every file only git changed — the
+// auto_apply policy. Files changed live are left for a human.
+func (r *Reconciler) AutoApply() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	remote := r.status.TargetSHA
+	want := map[string][]byte{}
+	for _, f := range r.status.Files {
+		if fs := r.fileState(f.Rel, remote); fs.Kind == kindTarget {
+			want[f.Rel] = fs.Target
+		}
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	applyErr := r.applyLocked(want)
+	if err := r.computeLocked(remote); err != nil {
+		return err
+	}
+	r.finishLocked()
+	return applyErr
+}
+
+// applyLocked writes desired live contents: backed up, config-checked
+// (rolled back on failure), then activated via targeted reloads.
+func (r *Reconciler) applyLocked(want map[string][]byte) error {
+	backupDir := filepath.Join(r.backupsDir, time.Now().Format("20060102-150405"))
+	saved := map[string][]byte{}
+	var written []string
+	rollback := func() {
+		for _, rel := range written {
+			if err := r.writeLive(rel, saved[rel]); err != nil {
+				log.Printf("rollback %s: %v", rel, err)
+			}
+		}
+	}
+	rels := make([]string, 0, len(want))
+	for rel := range want {
+		rels = append(rels, rel)
+	}
+	sort.Strings(rels)
 	for _, rel := range rels {
 		liveB := r.live(rel)
-		was := r.atRef(old, rel)
-		if liveB != nil && was != nil && !bytes.Equal(liveB, was) {
-			conflicts[rel] = "changed in both git and HA"
-			continue
-		}
-		want := r.atRef(new_, rel)
-		if want != nil && liveB != nil && bytes.Equal(liveB, want) {
-			// Live already has the desired content — e.g. a sops
-			// re-encryption that decrypts to the same plaintext. No
-			// write, no reload/restart.
+		if same(liveB, want[rel]) {
 			continue
 		}
 		if liveB != nil {
@@ -495,55 +666,88 @@ func (r *Reconciler) apply(old, new_ string) error {
 				return err
 			}
 		}
-		if err := r.writeLive(rel, want); err != nil {
-			log.Printf("apply %s: %v", rel, err)
-			conflicts[rel] = err.Error()
-			continue
+		saved[rel] = liveB
+		if err := r.writeLive(rel, want[rel]); err != nil {
+			rollback()
+			return fmt.Errorf("apply %s: %w", rel, err)
 		}
-		applied = append(applied, rel)
+		written = append(written, rel)
 	}
-
-	r.status.Conflicts = conflicts
-	if len(conflicts) > 0 {
-		keys := sortedKeys(conflicts)
-		r.ha.Notify("GitOps conflict",
-			"Changed in both git and HA, not applied: "+strings.Join(keys, ", "))
-	} else {
-		r.ha.Dismiss("GitOps conflict")
+	if len(written) == 0 {
+		return nil
 	}
+	ok, err := r.ha.CoreCheck()
+	if err != nil {
+		rollback()
+		return err
+	}
+	if !ok {
+		rollback()
+		r.ha.Notify("GitOps apply rolled back", fmt.Sprintf(
+			"%s failed core config check; live files restored.", strings.Join(written, ", ")))
+		return ErrRolledBack
+	}
+	r.activate(written)
+	log.Printf("applied to live: %v", written)
+	return nil
+}
 
-	if len(applied) > 0 {
-		ok, err := r.ha.CoreCheck()
+// CommitTarget commits the staged target buffer — each file's target
+// content with the picked rows taken from live — and pushes it.
+func (r *Reconciler) CommitTarget(picks []Picks, message string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	remote, err := r.fetchRemote()
+	if err != nil {
+		return err
+	}
+	if remote != r.status.TargetSHA {
+		return fmt.Errorf("target moved to %.9s: %w", remote, ErrStale)
+	}
+	// Start from a clean worktree at the remote head so leftovers from a
+	// previously failed commit (staged files, unpushed commits) can't
+	// poison this attempt.
+	if _, err := r.git("reset", "--hard", "origin/"+r.opts.Branch); err != nil {
+		return err
+	}
+	var rels []string
+	for _, p := range picks {
+		fs, err := r.resolve(p, remote, diff3.Live)
 		if err != nil {
 			return err
 		}
-		if !ok {
-			for _, rel := range applied { // roll back everything we wrote
-				name := strings.ReplaceAll(rel, "/", "__")
-				saved, err := os.ReadFile(filepath.Join(backupDir, name))
-				if err != nil {
-					saved = nil
-				}
-				if err := r.writeLive(rel, saved); err != nil {
-					log.Printf("rollback %s: %v", rel, err)
-				}
-			}
-			r.ha.Notify("GitOps apply rolled back", fmt.Sprintf(
-				"%.9s..%.9s failed core config check; live files restored.",
-				old, new_))
-			r.status.Error = "config check failed; rolled back"
-			return nil
+		if err := r.writeRepo(p.Rel, diff3.Compose(fs.Rows, diff3.Target, p.Rows)); err != nil {
+			return err
 		}
-		r.activate(applied)
-		log.Printf("applied %.9s..%.9s: %v", old, new_, applied)
+		rels = append(rels, p.Rel)
 	}
-
-	r.state.AppliedSHA = new_
-	if err := r.saveState(); err != nil {
+	head := remote
+	if _, err := r.git("diff", "--cached", "--quiet"); err == nil {
+		// Nothing staged — the repo already matches (e.g. a retried
+		// commit that had in fact been pushed). Recompute and move on.
+		log.Printf("commit: nothing to commit for %v", rels)
+	} else {
+		if message == "" {
+			message = "promote: " + strings.Join(rels, ", ")
+		}
+		if _, err := r.git("commit", "-m", message); err != nil {
+			return err
+		}
+		if _, err := r.git("push", "origin", "HEAD:"+r.opts.Branch); err != nil {
+			_, _ = r.git("reset", "--hard", "origin/"+r.opts.Branch)
+			return fmt.Errorf("push failed, worktree reset — refresh and retry: %v", err)
+		}
+		out, err := r.git("rev-parse", "HEAD")
+		if err != nil {
+			return err
+		}
+		head = strings.TrimSpace(out)
+	}
+	if err := r.computeLocked(head); err != nil {
 		return err
 	}
-	_, err = r.git("reset", "--hard", new_)
-	return err
+	r.finishLocked()
+	return nil
 }
 
 // activate reloads what it can and flags a restart for what it can't.
@@ -594,44 +798,29 @@ func (r *Reconciler) activate(all []string) {
 	}
 }
 
-func (r *Reconciler) computeDrift() error {
-	head := r.state.AppliedSHA
-	rels, err := r.managedRels(head)
-	if err != nil {
-		return err
-	}
-	drift := map[string]string{}
-	for _, rel := range rels {
-		want := r.atRef(head, rel)
-		liveB := r.live(rel)
-		switch {
-		case want == nil && liveB == nil:
-			// registered dashboard with no config yet, or vanished both
-			// sides — nothing to reconcile
-		case want == nil:
-			drift[rel] = "only in HA"
-		case liveB == nil:
-			drift[rel] = "missing in HA"
-		case !bytes.Equal(liveB, want):
-			drift[rel] = "modified in HA"
+// ---------- reporting ----------
+
+func (r *Reconciler) byKind(kind string) []string {
+	var out []string
+	for _, f := range r.status.Files {
+		if f.Kind == kind {
+			out = append(out, f.Rel)
 		}
 	}
-	r.status.Drift = drift
-	return nil
+	return out
 }
 
 func (r *Reconciler) publish() {
-	n := len(r.status.Drift) + len(r.status.Incoming) + len(r.status.Conflicts)
 	sha := r.state.AppliedSHA
 	if len(sha) > 9 {
 		sha = sha[:9]
 	}
-	r.ha.SetState("sensor.ha_gitops_drift", fmt.Sprint(n), map[string]any{
+	r.ha.SetState("sensor.ha_gitops_drift", fmt.Sprint(len(r.status.Files)), map[string]any{
 		"friendly_name":    "GitOps drift",
 		"icon":             "mdi:source-branch-sync",
-		"drift":            sortedKeys(r.status.Drift),
-		"incoming":         sortedKeys(r.status.Incoming),
-		"conflicts":        sortedKeys(r.status.Conflicts),
+		"drift":            r.byKind(kindLive),
+		"incoming":         r.byKind(kindTarget),
+		"conflicts":        r.byKind(kindBoth),
 		"applied_sha":      sha,
 		"restart_required": r.status.RestartRequired,
 	})
@@ -639,29 +828,29 @@ func (r *Reconciler) publish() {
 
 const driftNotifyTitle = "GitOps: drift detected"
 
+var kindReason = map[string]string{
+	kindLive:   "changed in HA",
+	kindTarget: "changed in git",
+	kindBoth:   "changed in both git and HA",
+}
+
 // notifyDrift maintains one persistent notification listing every file
-// that needs a human decision (drift, incoming, and conflicts). It only
-// touches HA when the set changes: new files push through
-// notify_service too, a shrinking set refreshes the notification
-// silently, and an empty set dismisses it. In-memory tracking means an
-// add-on restart re-notifies once, which doubles as a reminder.
-// Incoming is excluded under auto_apply — those files resolve on their
-// own moments later and would only generate push noise.
+// that needs a human decision. It only touches HA when the set changes:
+// new files push through notify_service too, a shrinking set refreshes
+// the notification silently, and an empty set dismisses it. In-memory
+// tracking means an add-on restart re-notifies once, which doubles as a
+// reminder. Git-only changes are excluded under auto_apply — those files
+// resolve on their own moments later and would only generate push noise.
 func (r *Reconciler) notifyDrift() {
 	if !r.opts.NotifyDrift {
 		return
 	}
 	current := map[string]string{}
-	for rel, reason := range r.status.Drift {
-		current[rel] = reason
-	}
-	if !r.opts.AutoApply {
-		for rel, reason := range r.status.Incoming {
-			current[rel] = reason
+	for _, f := range r.status.Files {
+		if f.Kind == kindTarget && r.opts.AutoApply {
+			continue
 		}
-	}
-	for rel, reason := range r.status.Conflicts {
-		current[rel] = "conflict: " + reason
+		current[f.Rel] = kindReason[f.Kind]
 	}
 
 	if len(current) == 0 {
@@ -686,7 +875,7 @@ func (r *Reconciler) notifyDrift() {
 	for _, rel := range sortedKeys(current) {
 		fmt.Fprintf(&b, "- %s — %s\n", rel, current[rel])
 	}
-	b.WriteString("\nOpen the GitOps panel to apply or promote.")
+	b.WriteString("\nOpen the GitOps panel to apply or commit.")
 	if hasNew {
 		r.ha.Notify(driftNotifyTitle, b.String())
 	} else {
@@ -705,222 +894,4 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(keys)
 	return keys
-}
-
-// ---------- human actions (from the web UI) ----------
-
-func (r *Reconciler) RefreshNow() error { return r.Tick() }
-
-// ApplyUpstream writes the pending upstream changes (applied..remote)
-// into live HA: sops-decrypted, config-checked (rolled back on failure),
-// then activated. Files changed on both sides become conflicts and are
-// never overwritten.
-func (r *Reconciler) ApplyUpstream() error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if err := r.ensureRepo(); err != nil {
-		return err
-	}
-	if _, err := r.git("fetch", "origin", r.opts.Branch); err != nil {
-		return err
-	}
-	remote, err := r.git("rev-parse", "origin/"+r.opts.Branch)
-	if err != nil {
-		return err
-	}
-	remote = strings.TrimSpace(remote)
-	if remote != r.state.AppliedSHA {
-		if err := r.apply(r.state.AppliedSHA, remote); err != nil {
-			return err
-		}
-	}
-	// apply may have kept the baseline (config-check rollback) — recompute
-	// so incoming reflects what is still pending rather than going stale.
-	if err := r.computeIncoming(remote); err != nil {
-		return err
-	}
-	if err := r.computeDrift(); err != nil {
-		return err
-	}
-	r.publish()
-	r.notifyDrift()
-	r.status.LastSync = time.Now().Format("2006-01-02 15:04:05")
-	return nil
-}
-
-// CanRevert reports whether reverting rel is a supported operation.
-// A "live only" dashboard or registry has nothing in git to revert to —
-// reverting would delete live state, which those domains refuse.
-func (r *Reconciler) CanRevert(rel string) bool {
-	if !isDashboard(rel) && !isRegistry(rel) {
-		return true
-	}
-	r.mu.Lock()
-	head := r.state.AppliedSHA
-	r.mu.Unlock()
-	return r.atRef(head, rel) != nil
-}
-
-func (r *Reconciler) Revert(rel string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	want := r.atRef(r.state.AppliedSHA, rel)
-	if err := r.writeLive(rel, want); err != nil {
-		return err
-	}
-	r.activate([]string{rel})
-	if err := r.computeDrift(); err != nil {
-		return err
-	}
-	r.publish()
-	r.notifyDrift()
-	return nil
-}
-
-func (r *Reconciler) Promote(rels []string, message string) error {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	// Start from a clean worktree at the remote head so leftovers from a
-	// previously failed promote (staged files, unpushed commits) can't
-	// poison this attempt. Live state is the source of truth for what
-	// gets promoted, so nothing is lost by discarding local repo state.
-	if _, err := r.git("fetch", "origin", r.opts.Branch); err != nil {
-		return err
-	}
-	if _, err := r.git("reset", "--hard", "origin/"+r.opts.Branch); err != nil {
-		return err
-	}
-	for _, rel := range rels {
-		liveB := r.live(rel)
-		if liveB == nil {
-			if _, err := r.git("rm", "-q", "--ignore-unmatch",
-				r.opts.Subfolder+"/"+rel); err != nil {
-				return err
-			}
-			continue
-		}
-		if rel == secretsPlain {
-			// Re-encrypt with the repo's .sops.yaml recipients so the
-			// operator key can still decrypt. Rules match by path.
-			out := filepath.Join(r.repoDir, r.opts.Subfolder, secretsSops)
-			if err := os.WriteFile(out, liveB, 0o600); err != nil {
-				return err
-			}
-			cmd := exec.Command("sops", "--encrypt", "--in-place", out)
-			cmd.Dir = r.repoDir
-			cmd.Env = append(os.Environ(), "HOME=/data")
-			if o, err := cmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("sops encrypt: %v: %s", err, o)
-			}
-			if _, err := r.git("add", r.opts.Subfolder+"/"+secretsSops); err != nil {
-				return err
-			}
-			continue
-		}
-		target := filepath.Join(r.repoDir, r.opts.Subfolder, rel)
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(target, liveB, 0o644); err != nil {
-			return err
-		}
-		if _, err := r.git("add", r.opts.Subfolder+"/"+rel); err != nil {
-			return err
-		}
-	}
-	if _, err := r.git("diff", "--cached", "--quiet"); err == nil {
-		// Nothing staged — repo already matches live (e.g. a retried
-		// promote that had in fact been pushed). Recompute and move on.
-		log.Printf("promote: nothing to commit for %v", rels)
-	} else {
-		if message == "" {
-			message = "promote: " + strings.Join(rels, ", ")
-		}
-		if _, err := r.git("commit", "-m", message); err != nil {
-			return err
-		}
-		if _, err := r.git("push", "origin", "HEAD:"+r.opts.Branch); err != nil {
-			_, _ = r.git("reset", "--hard", "origin/"+r.opts.Branch)
-			return fmt.Errorf("push failed, worktree reset — sync and retry: %v", err)
-		}
-	}
-	head, err := r.git("rev-parse", "HEAD")
-	if err != nil {
-		return err
-	}
-	r.state.AppliedSHA = strings.TrimSpace(head)
-	if err := r.saveState(); err != nil {
-		return err
-	}
-	if err := r.computeDrift(); err != nil {
-		return err
-	}
-	r.publish()
-	r.notifyDrift()
-	return nil
-}
-
-// DiffText renders a unified diff of git (applied) vs live for the UI —
-// additions are the HA-side edits. Secrets are masked to avoid leaking
-// values into the panel.
-func (r *Reconciler) DiffText(rel string) string {
-	if rel == secretsPlain {
-		return "(secrets diff masked — values changed)"
-	}
-	r.mu.Lock()
-	head := r.state.AppliedSHA
-	r.mu.Unlock()
-	return diffText(r.atRef(head, rel), "git/", r.live(rel), "live/")
-}
-
-// IncomingDiffText renders what applying the pending upstream changes
-// would do to live HA — additions are git's incoming content.
-func (r *Reconciler) IncomingDiffText(rel string) string {
-	if rel == secretsPlain {
-		return "(secrets diff masked — values changed)"
-	}
-	r.mu.Lock()
-	pending := r.status.PendingSHA
-	r.mu.Unlock()
-	if pending == "" {
-		return ""
-	}
-	return diffText(r.live(rel), "live/", r.atRef(pending, rel), "git/")
-}
-
-func diffText(from []byte, fromPrefix string, to []byte, toPrefix string) string {
-	tmpFile := func(prefix string, content []byte) (string, error) {
-		if content == nil {
-			return os.DevNull, nil
-		}
-		tmp, err := os.CreateTemp("", prefix)
-		if err != nil {
-			return "", err
-		}
-		_, werr := tmp.Write(content)
-		cerr := tmp.Close()
-		if werr != nil || cerr != nil {
-			return "", fmt.Errorf("write temp: %v %v", werr, cerr)
-		}
-		return tmp.Name(), nil
-	}
-	fromPath, err := tmpFile("from-*", from)
-	if err != nil {
-		return err.Error()
-	}
-	if fromPath != os.DevNull {
-		defer os.Remove(fromPath)
-	}
-	toPath, err := tmpFile("to-*", to)
-	if err != nil {
-		return err.Error()
-	}
-	if toPath != os.DevNull {
-		defer os.Remove(toPath)
-	}
-	// git diff --no-index exits 1 when files differ; that's expected.
-	cmd := exec.Command("git", "diff", "--no-index",
-		"--src-prefix="+fromPrefix, "--dst-prefix="+toPrefix, fromPath, toPath)
-	out, _ := cmd.Output()
-	return string(out)
 }
