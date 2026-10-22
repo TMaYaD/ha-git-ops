@@ -14,8 +14,12 @@ import (
 	"github.com/TMaYaD/ha-git-ops/diff3"
 )
 
-// fakeSupervisor answers every Supervisor call; the core check passes.
-type fakeSupervisor struct{ bodies []string }
+// fakeSupervisor answers every Supervisor call; the core check passes
+// unless checkFail holds HA's reason.
+type fakeSupervisor struct {
+	bodies    []string
+	checkFail string
+}
 
 func (f *fakeSupervisor) RoundTrip(req *http.Request) (*http.Response, error) {
 	call := req.Method + " " + req.URL.Path
@@ -27,6 +31,10 @@ func (f *fakeSupervisor) RoundTrip(req *http.Request) (*http.Response, error) {
 	body := "{}"
 	if req.URL.Path == "/core/check" {
 		body = `{"result":"ok"}`
+		if f.checkFail != "" {
+			b, _ := json.Marshal(map[string]string{"result": "error", "message": f.checkFail})
+			body = string(b)
+		}
 	}
 	return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}}, nil
 }

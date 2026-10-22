@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.1
+
+- **Apply checks the config before writing anything.** Every file an
+  apply would change is parsed first — YAML (HA tags like `!include` and
+  `!secret` allowed), JSON, dashboards and registries (unknown fields
+  refused) — and one failure blocks the whole apply with nothing
+  written. HA's core check still runs once the YAML files are on disk,
+  but now before any dashboard or registry change goes live over the
+  websocket, so a failed check no longer briefly pushes them to HA. The
+  panel error and notification include HA's reason for a failed check,
+  and `auto_apply` retrying the same bad commit notifies once rather than
+  every poll.
+
 ## 0.8.0
 
 - **Commit to another branch.** The target buffer has a branch field, and

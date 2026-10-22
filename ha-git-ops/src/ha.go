@@ -73,21 +73,23 @@ func (h *HA) req(method, path string, body any) (int, []byte, error) {
 	return resp.StatusCode, raw, err
 }
 
-// CoreCheck runs `ha core check`; false means the config is invalid.
-func (h *HA) CoreCheck() (bool, error) {
+// CoreCheck runs `ha core check`; false means the config is invalid,
+// with HA's reason when it gave one.
+func (h *HA) CoreCheck() (bool, string, error) {
 	status, raw, err := h.req("POST", "/core/check", nil)
 	if err != nil {
-		return false, fmt.Errorf("core check request: %w", err)
+		return false, "", fmt.Errorf("core check request: %w", err)
 	}
 	var body struct {
-		Result string `json:"result"`
+		Result  string `json:"result"`
+		Message string `json:"message"`
 	}
 	_ = json.Unmarshal(raw, &body)
 	ok := status == 200 && body.Result == "ok"
 	if !ok {
 		log.Printf("core config check failed: %s", raw)
 	}
-	return ok, nil
+	return ok, strings.TrimSpace(body.Message), nil
 }
 
 func (h *HA) CoreRestart() {
