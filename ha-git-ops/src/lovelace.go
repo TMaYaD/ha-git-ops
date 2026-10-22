@@ -101,23 +101,45 @@ func (r *Reconciler) dashboardLive(rel string) []byte {
 	return b
 }
 
-// dashboardWrite pushes desired config to the live dashboard via the
-// websocket API. content == nil (file deleted in git) is unsupported.
-func (r *Reconciler) dashboardWrite(rel string, content []byte) error {
+// parseDashboard reads desired content as the config mapping
+// lovelace/config/save takes. nil (file deleted in git) is unsupported.
+func parseDashboard(rel string, content []byte) (map[string]any, error) {
 	if content == nil {
-		return fmt.Errorf("%s: deleting dashboards from git is not applied; delete it in the UI and promote", rel)
+		return nil, fmt.Errorf("%s: deleting dashboards from git is not applied; delete it in the UI and promote", rel)
 	}
+	var cfg map[string]any
+	if err := yaml.Unmarshal(content, &cfg); err != nil {
+		return nil, fmt.Errorf("%s: parse desired config: %w", rel, err)
+	}
+	if cfg == nil {
+		return nil, fmt.Errorf("%s: empty dashboard config", rel)
+	}
+	return cfg, nil
+}
+
+// dashboardFor finds the live storage dashboard rel writes to.
+func (r *Reconciler) dashboardFor(rel string) (dashboard, error) {
 	dbs, err := r.liveDashboards()
 	if err != nil {
-		return err
+		return dashboard{}, err
 	}
 	db, ok := dbs[rel]
 	if !ok {
-		return fmt.Errorf("%s: no live storage dashboard with this url_path; create it in the UI first", rel)
+		return dashboard{}, fmt.Errorf("%s: no live storage dashboard with this url_path; create it in the UI first", rel)
 	}
-	var cfg any
-	if err := yaml.Unmarshal(content, &cfg); err != nil {
-		return fmt.Errorf("%s: parse desired config: %w", rel, err)
+	return db, nil
+}
+
+// dashboardWrite pushes desired config to the live dashboard via the
+// websocket API.
+func (r *Reconciler) dashboardWrite(rel string, content []byte) error {
+	cfg, err := parseDashboard(rel, content)
+	if err != nil {
+		return err
+	}
+	db, err := r.dashboardFor(rel)
+	if err != nil {
+		return err
 	}
 	return r.ha.LovelaceSave(db.URLPath, cfg)
 }

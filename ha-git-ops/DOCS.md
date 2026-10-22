@@ -63,8 +63,12 @@ on the box. Promote only takes applied live content: a line staged into
 live must be applied before it can be promoted.
 
 The sidebar lists both buffers. **Apply to live** writes the live buffer
-— sops-decrypted, config-checked (rolled back on failure), then activated
-via targeted reloads; `configuration.yaml`/`secrets.yaml` changes flag a
+— sops-decrypted, then checked before anything is written: every file
+must parse (YAML, JSON, dashboards, registries), or the apply is blocked
+and nothing changes. The YAML files are then written and run through
+HA's core config check (rolled back on failure, with HA's reason shown)
+before dashboard and registry changes go live, then activated via
+targeted reloads; `configuration.yaml`/`secrets.yaml` changes flag a
 restart instead (or restart automatically with `auto_restart_core:
 true`). **Commit & push** commits the target buffer with your message.
 Staging in the other buffer survives either action. A write is refused

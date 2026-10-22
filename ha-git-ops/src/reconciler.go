@@ -74,6 +74,8 @@ var (
 	ErrStale = errors.New("changed since the panel loaded it — refresh and review again")
 	// ErrRolledBack reports an apply undone by a failed config check.
 	ErrRolledBack = errors.New("core config check failed; live files restored")
+	// ErrInvalid reports an apply blocked before anything was written.
+	ErrInvalid = errors.New("config check failed; nothing applied")
 )
 
 // FileState is one file that needs a decision.
@@ -142,6 +144,7 @@ type Reconciler struct {
 	state    persistedState
 	status   Status
 	notified map[string]bool // rels covered by the current drift notification
+	alerted  string          // last apply failure notified
 	// view is the branch the panel switched the target to; "" for the
 	// tracked branch. It isn't persisted: a restart is back on the tracked
 	// branch.
@@ -1039,9 +1042,32 @@ func (r *Reconciler) AutoApply() error {
 	return applyErr
 }
 
-// applyLocked writes desired live contents: backed up, config-checked
-// (rolled back on failure), then activated via targeted reloads.
+// applyLocked writes desired live contents: checked first (nothing is
+// written if any file fails), backed up, written to disk and
+// core-checked (rolled back on failure), then pushed over the websocket
+// and activated via targeted reloads. Dashboards and registries go last
+// because a websocket write is live at once — a core-check failure must
+// stop them from ever reaching HA.
 func (r *Reconciler) applyLocked(want map[string][]byte) error {
+	var files, ws []string
+	for _, rel := range sortedKeys(want) {
+		if same(r.live(rel), want[rel]) {
+			continue
+		}
+		if isDashboard(rel) || isRegistry(rel) {
+			ws = append(ws, rel)
+		} else {
+			files = append(files, rel)
+		}
+	}
+	if len(files)+len(ws) == 0 {
+		return nil
+	}
+	if err := r.checkLocked(append(append([]string{}, files...), ws...), want); err != nil {
+		r.alert("GitOps apply blocked", err.Error()+"\n\nNothing was written; fix the files and apply again.")
+		return err
+	}
+
 	backupDir := filepath.Join(r.backupsDir, time.Now().Format("20060102-150405"))
 	saved := map[string][]byte{}
 	var written []string
@@ -1052,16 +1078,8 @@ func (r *Reconciler) applyLocked(want map[string][]byte) error {
 			}
 		}
 	}
-	rels := make([]string, 0, len(want))
-	for rel := range want {
-		rels = append(rels, rel)
-	}
-	sort.Strings(rels)
-	for _, rel := range rels {
+	write := func(rel string) error {
 		liveB := r.live(rel)
-		if same(liveB, want[rel]) {
-			continue
-		}
 		if liveB != nil {
 			if err := os.MkdirAll(backupDir, 0o700); err != nil {
 				return err
@@ -1073,28 +1091,59 @@ func (r *Reconciler) applyLocked(want map[string][]byte) error {
 		}
 		saved[rel] = liveB
 		if err := r.writeLive(rel, want[rel]); err != nil {
-			rollback()
 			return fmt.Errorf("apply %s: %w", rel, err)
 		}
 		written = append(written, rel)
-	}
-	if len(written) == 0 {
 		return nil
 	}
-	ok, err := r.ha.CoreCheck()
-	if err != nil {
-		rollback()
-		return err
+
+	for _, rel := range files {
+		if err := write(rel); err != nil {
+			rollback()
+			return err
+		}
 	}
-	if !ok {
-		rollback()
-		r.ha.Notify("GitOps apply rolled back", fmt.Sprintf(
-			"%s failed core config check; live files restored.", strings.Join(written, ", ")))
-		return ErrRolledBack
+	if len(written) > 0 {
+		ok, msg, err := r.ha.CoreCheck()
+		if err != nil {
+			rollback()
+			return err
+		}
+		if !ok {
+			rollback()
+			if msg != "" {
+				err = fmt.Errorf("%w: %s", ErrRolledBack, msg)
+			} else {
+				err = ErrRolledBack
+			}
+			note := strings.Join(written, ", ") + " failed core config check; live files restored."
+			if msg != "" {
+				note += "\n\n" + msg
+			}
+			r.alert("GitOps apply rolled back", note)
+			return err
+		}
 	}
+	for _, rel := range ws {
+		if err := write(rel); err != nil {
+			rollback()
+			return err
+		}
+	}
+	r.alerted = ""
 	r.activate(written)
 	log.Printf("applied to live: %v", written)
 	return nil
+}
+
+// alert notifies of a failed apply once per distinct failure, so
+// auto_apply retrying the same bad commit every poll doesn't re-push it.
+func (r *Reconciler) alert(title, message string) {
+	if r.alerted == title+message {
+		return
+	}
+	r.alerted = title + message
+	r.ha.Notify(title, message)
 }
 
 // CommitBranch is where commits go unless the panel names another
@@ -1381,7 +1430,7 @@ func (r *Reconciler) notifyDrift() {
 	}
 }
 
-func sortedKeys(m map[string]string) []string {
+func sortedKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)

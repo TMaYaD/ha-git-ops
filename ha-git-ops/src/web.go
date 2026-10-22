@@ -102,7 +102,7 @@ func NewWebUI(rec *Reconciler, branch string) http.Handler {
 		switch {
 		case errors.Is(err, ErrStale):
 			status = http.StatusConflict
-		case errors.Is(err, ErrRolledBack):
+		case errors.Is(err, ErrRolledBack), errors.Is(err, ErrInvalid):
 			status = http.StatusUnprocessableEntity
 		}
 		writeJSON(w, status, map[string]any{"error": err.Error(), "state": state()})
