@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.7.0
+## 0.8.0
 
 - **Commit to another branch.** The target buffer has a branch field, and
   a new `commit_branch` option sets its default (empty commits straight
@@ -11,6 +11,14 @@
   with each new change merged onto it, while a new or already-merged one
   starts fresh. Promoted lines keep showing as live changes until the PR
   is merged.
+
+## 0.7.0
+
+- **Unified diff view.** A *Side by side / Unified* toggle in the panel's
+  top bar. Unified shows each file as a plain two-way diff —
+  last-applied → live or live → target — that copies cleanly (line
+  numbers aren't part of the selection), with *Copy diff* per file and
+  *Copy all*. It's read-only; staging stays in the side-by-side view.
 
 ## 0.6.2
 

@@ -192,6 +192,29 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
 .arr2.arr-r { left: 9px; }
 .arr2.arr-l { right: 9px; }
 
+.tactions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--card); }
+.seg button {
+  border: 0; background: transparent; color: var(--muted); font: 600 13px system-ui, sans-serif;
+  padding: 0 12px; min-height: 44px; cursor: pointer;
+}
+.seg button + button { border-left: 1px solid var(--border); }
+.seg button[aria-pressed="true"] { background: var(--code-bg); color: var(--text); }
+.ubar { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.fh .linkbtn { margin-left: auto; }
+
+.ud { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; line-height: 1.6; padding: 6px 0; }
+.ul { display: flex; min-height: 1.6em; padding-right: 12px; }
+/* Line numbers live in a pseudo-element so selecting and copying the
+   block yields a plain diff. */
+.ul::before { content: attr(data-n); white-space: pre; flex: none; color: var(--muted); padding: 0 10px; user-select: none; }
+.ul .tx { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 0; }
+.ul.meta { color: var(--muted); font-weight: 650; }
+.ul.hunk { color: var(--primary); }
+.ul.base { color: var(--base); background: var(--base-bg); }
+.ul.live { color: var(--live); background: var(--live-bg); }
+.ul.target { color: var(--target); background: var(--target-bg); }
+
 .empty { text-align: center; color: var(--muted); padding: 3.5rem 1rem; }
 .empty .lead { color: var(--text); font-weight: 600; font-size: 1.05rem; margin: .2rem 0; }
 
@@ -252,6 +275,11 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
     apply: { into: 'live', from: 'target', verb: 'Stage target into live' },
     promote: { into: 'target', from: 'live', block: 'live', verb: 'Stage live into target' }
   };
+  // Two-way pairs the unified view can show, as [old, new].
+  var PAIRS = {
+    'base-live': { a: 'base', b: 'live', hint: 'what changed in Home Assistant since the last apply' },
+    'live-target': { a: 'live', b: 'target', hint: 'what applying target would change in Home Assistant' }
+  };
   var CTX = 3;
 
   function load(k, d) {
@@ -265,6 +293,8 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
     data: null,
     files: [],
     show: load('show', { base: false, live: true, target: true }),
+    view: load('view', 'grid'),       // 'grid' (side by side) or 'unified'
+    pair: load('pair', 'live-target'), // PAIRS key for the unified view
     filter: 'all',
     buf: {},      // rel -> { token, live: {row: src}, target: {row: src} }
     sel: {},      // rel -> { row: true }
@@ -276,6 +306,8 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
   if (['base', 'live', 'target'].filter(function (k) { return S.show[k]; }).length < 2) {
     S.show = { base: false, live: true, target: true };
   }
+  if (S.view !== 'unified') S.view = 'grid';
+  if (!PAIRS[S.pair]) S.pair = 'live-target';
 
   function prepare(af) {
     var n = [0, 0, 0];
@@ -760,6 +792,100 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
     return el;
   }
 
+  // ---------- rendering: unified ----------
+
+  // udiff lays out a plain unified diff of version a against version b
+  // from each version's own content (staging is not shown), or null when
+  // the two agree. lines carry the gutter separately from the text, so
+  // text joined by newlines is the diff as git would print it.
+  function udiff(f, a, b) {
+    var A = VER[a].i, B = VER[b].i, items = [], dels = [], adds = [], na = 0, nb = 0;
+    var flush = function () { items = items.concat(dels, adds); dels = []; adds = []; };
+    f.rows.forEach(function (r) {
+      var x = r.v[A], y = r.v[B];
+      if (x === y) { if (x !== null) { flush(); items.push({ t: ' ', s: x, a: ++na, b: ++nb }); } return; }
+      if (x !== null) dels.push({ t: '-', s: x, a: ++na });
+      if (y !== null) adds.push({ t: '+', s: y, b: ++nb });
+    });
+    flush();
+
+    var spans = [], cur = null;
+    items.forEach(function (it, k) {
+      if (it.t === ' ') return;
+      if (cur && k - cur.z <= 2 * CTX + 1) cur.z = k;
+      else spans.push(cur = { a: k, z: k });
+    });
+    if (!spans.length) return null;
+
+    var w = Math.max(3, String(Math.max(na, nb)).length);
+    var pad = function (n) { return (Array(w + 1).join(' ') + (n || '')).slice(-w); };
+    var blank = pad('') + ' ' + pad('');
+    var path = function (v, absent) { return absent ? '/dev/null' : v.name + '/' + f.rel; };
+    var lines = [
+      { cls: 'meta', n: blank, text: '--- ' + path(VER[a], f.absent[A]) },
+      { cls: 'meta', n: blank, text: '+++ ' + path(VER[b], f.absent[B]) }
+    ];
+    spans.forEach(function (sp) {
+      var lo = Math.max(0, sp.a - CTX), hi = Math.min(items.length - 1, sp.z + CTX);
+      var before = items.slice(0, lo), chunk = items.slice(lo, hi + 1);
+      var range = function (skip) {
+        var n = chunk.filter(function (it) { return it.t !== skip; }).length;
+        var at = before.filter(function (it) { return it.t !== skip; }).length;
+        return (n ? at + 1 : at) + ',' + n;
+      };
+      lines.push({ cls: 'hunk', n: blank, text: '@@ -' + range('+') + ' +' + range('-') + ' @@' });
+      chunk.forEach(function (it) {
+        lines.push({ cls: it.t === '-' ? a : it.t === '+' ? b : '', n: pad(it.a) + ' ' + pad(it.b), text: it.t + it.s });
+      });
+    });
+    return { lines: lines, text: lines.map(function (l) { return l.text; }).join('\n') + '\n' };
+  }
+
+  function buildUnified(f, d) {
+    var p = PAIRS[S.pair], kind = KIND[f.kind];
+    return h('section', { class: 'card', id: 'file-' + f.rel, 'aria-label': f.rel },
+      h('div', { class: 'fh' },
+        h('code', { class: 'path', text: f.rel }),
+        h('span', { class: 'pill ' + kind.cls, text: kind.label }),
+        copyBtn('Copy diff', 'Copy the ' + VER[p.a].name + ' → ' + VER[p.b].name + ' diff of ' + f.rel, function () { return d.text; })),
+      f.masked ? h('p', { class: 'note', text: 'Secret values are masked; matching tags mean matching values.' }) : null,
+      h('div', { class: 'scroll' }, h('div', { class: 'ud' }, d.lines.map(function (l) {
+        return h('div', { class: 'ul ' + l.cls, 'data-n': l.n }, h('span', { class: 'tx', text: l.text }));
+      }))));
+  }
+
+  // HA is often served over plain http or inside an iframe without
+  // clipboard access, so fall back to copying from a hidden textarea.
+  function copyText(s) {
+    var legacy = function () {
+      var ta = h('textarea', { readonly: true, style: 'position:fixed;top:0;left:0;opacity:0' });
+      ta.value = s;
+      document.body.appendChild(ta);
+      ta.select();
+      var ok = false;
+      try { ok = document.execCommand('copy'); } catch (e) { /* reported below */ }
+      ta.remove();
+      if (!ok) throw new Error('copy failed');
+    };
+    if (navigator.clipboard && window.isSecureContext) return navigator.clipboard.writeText(s).catch(legacy);
+    return Promise.resolve().then(legacy);
+  }
+  function copyBtn(label, aria, text) {
+    var b = h('button', {
+      type: 'button', class: 'linkbtn', 'aria-label': aria, onclick: function () {
+        copyText(text()).then(function () { b.textContent = 'Copied'; }, function () { b.textContent = 'Copy failed — select the text instead'; })
+          .then(function () { setTimeout(function () { b.textContent = label; }, 2000); });
+      }
+    }, label);
+    return b;
+  }
+
+  function seg(label, opts, cur, pick) {
+    return h('div', { class: 'seg', role: 'group', 'aria-label': label }, opts.map(function (o) {
+      return h('button', { type: 'button', 'aria-pressed': String(cur === o[0]), onclick: function () { pick(o[0]); } }, o[1]);
+    }));
+  }
+
   // ---------- rendering: page ----------
 
   var msgBox = h('textarea', { id: 'commit-msg', class: 'msg', rows: '2', placeholder: 'Commit message' });
@@ -791,7 +917,10 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
           : S.files.length ? h('span', { class: 'pill p-warn', text: plural(S.files.length, 'file') + ' differ' })
             : h('span', { class: 'pill p-ok', text: '✓ in sync' }),
         h('span', { class: 'muted', text: 'refreshed ' + (d.lastSync || 'never') })),
-      h('button', { type: 'button', class: 'btn', disabled: !!S.busy, onclick: doRefresh }, ICON.refresh(), 'Refresh'));
+      h('div', { class: 'tactions' },
+        S.files.length ? seg('Diff view', [['grid', 'Side by side'], ['unified', 'Unified']], S.view,
+          function (v) { S.view = v; save('view', v); render(); }) : null,
+        h('button', { type: 'button', class: 'btn', disabled: !!S.busy, onclick: doRefresh }, ICON.refresh(), 'Refresh')));
 
     var banners = [];
     if (d.restartRequired) banners.push(h('p', { class: 'banner warn', text: 'Restart Home Assistant Core to activate the applied changes.' }));
@@ -809,6 +938,28 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
             return h('button', { type: 'button', class: 'fchip', 'aria-pressed': String(S.filter === c[0]), onclick: function () { S.filter = c[0]; render(); } },
               c[1] + ' ', h('span', { class: 'n', text: String(c[2]) }));
           })));
+    }
+    if (S.files.length && S.view === 'unified') {
+      var p = PAIRS[S.pair], cards = [], texts = [], same = [];
+      S.files.forEach(function (f) {
+        if (S.filter !== 'all' && f.kind !== S.filter) return;
+        var ud = udiff(f, p.a, p.b);
+        if (!ud) { same.push(f.rel); return; }
+        cards.push(buildUnified(f, ud));
+        texts.push(ud.text);
+      });
+      body.push(h('div', { class: 'ubar' },
+        seg('Versions to compare', Object.keys(PAIRS).map(function (k) {
+          return [k, VER[PAIRS[k].a].name + ' → ' + VER[PAIRS[k].b].name];
+        }), S.pair, function (k) { S.pair = k; save('pair', k); render(); }),
+        texts.length ? copyBtn('Copy all', 'Copy the diffs of all ' + plural(texts.length, 'file') + ' shown',
+          function () { return texts.join(''); }) : null));
+      body.push(h('p', { class: 'hint', text: 'Shows ' + p.hint + ', as a plain diff to read or copy. Staging needs the side-by-side view.' }));
+      body.push(cards);
+      if (same.length) {
+        body.push(h('p', { class: 'hint', text: same.join(', ') + (same.length === 1 ? ' has' : ' have') + ' no ' + VER[p.a].name + ' → ' + VER[p.b].name + ' changes.' }));
+      }
+    } else if (S.files.length) {
       var desc = {
         base: ['synced to HA · ', short(d.appliedSha) + (d.movedBaselines ? ' (' + plural(d.movedBaselines, 'file') + ' from the previous target)' : '')],
         live: ['what Home Assistant runs now', null],

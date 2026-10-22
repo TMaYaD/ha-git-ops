@@ -70,6 +70,13 @@ Staging in the other buffer survives either action. A write is refused
 if any of the three versions changed since the panel loaded them —
 refresh and review again.
 
+**Unified** (top bar) switches to a read-only two-way diff, for reading
+a change or pasting it elsewhere: **last-applied → live** (what changed
+in HA since the last apply) or **live → target** (what applying would
+change). Selecting the text copies a plain diff without line numbers;
+**Copy diff** and **Copy all** copy it with `---`/`+++` headers. It shows
+each version's own content, not staged lines; stage in **Side by side**.
+
 ### Committing to another branch
 
 The target buffer has a branch field, defaulting to `commit_branch` (or
