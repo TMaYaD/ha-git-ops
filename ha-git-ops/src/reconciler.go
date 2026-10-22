@@ -92,6 +92,15 @@ type persistedState struct {
 	// Files that converged on a newer target while others still differ
 	// keep their own baseline until AppliedSHA catches up.
 	Baselines map[string]string `json:"baselines,omitempty"`
+	// Target is where the baseline came from. A baseline only means
+	// something for the repo, branch and subfolder it was taken from.
+	Target *targetID `json:"target,omitempty"`
+}
+
+type targetID struct {
+	RepoURL   string `json:"repo_url"`
+	Branch    string `json:"branch"`
+	Subfolder string `json:"subfolder"`
 }
 
 type Reconciler struct {
@@ -207,22 +216,47 @@ func (r *Reconciler) git(args ...string) (string, error) {
 	return out.String(), nil
 }
 
-func (r *Reconciler) ensureRepo() error {
-	if _, err := os.Stat(filepath.Join(r.repoDir, ".git")); err == nil {
-		return nil
-	}
+// ensureRepo makes /data/repo a clone of the configured repo with the
+// configured subfolder checked out. A clone left over from a different
+// repo_url or subfolder is replaced; stale reports that it was.
+func (r *Reconciler) ensureRepo() (stale bool, err error) {
 	if r.opts.RepoURL == "" {
-		return fmt.Errorf("repo_url is not configured")
+		return false, fmt.Errorf("repo_url is not configured")
+	}
+	if _, err := os.Stat(filepath.Join(r.repoDir, ".git")); err == nil {
+		url, _ := r.git("remote", "get-url", "origin")
+		sparse, _ := r.git("sparse-checkout", "list")
+		if strings.TrimSpace(url) == r.opts.RepoURL && strings.Trim(strings.TrimSpace(sparse), "/") == r.opts.Subfolder {
+			return false, r.configureRepo()
+		}
+		log.Printf("clone at %s tracks %s:%s; re-cloning for %s:%s", r.repoDir,
+			strings.TrimSpace(url), strings.TrimSpace(sparse), r.opts.RepoURL, r.opts.Subfolder)
+		if err := os.RemoveAll(r.repoDir); err != nil {
+			return true, err
+		}
+		stale = true
 	}
 	cmd := exec.Command("git", "clone", "--filter=blob:none", "--no-checkout",
 		"--branch", r.opts.Branch, r.opts.RepoURL, r.repoDir)
 	cmd.Env = r.gitEnv()
 	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("git clone: %v: %s", err, out)
+		return stale, fmt.Errorf("git clone: %v: %s", err, out)
 	}
 	for _, args := range [][]string{
 		{"sparse-checkout", "set", r.opts.Subfolder},
 		{"checkout", r.opts.Branch},
+	} {
+		if _, err := r.git(args...); err != nil {
+			return stale, err
+		}
+	}
+	return stale, r.configureRepo()
+}
+
+// configureRepo applies the commit identity, which may change between
+// restarts without anything else changing.
+func (r *Reconciler) configureRepo() error {
+	for _, args := range [][]string{
 		{"config", "user.name", r.opts.CommitName},
 		{"config", "user.email", r.opts.CommitEmail},
 	} {
@@ -233,19 +267,26 @@ func (r *Reconciler) ensureRepo() error {
 	return nil
 }
 
-// fetchRemote fetches the branch and returns its head.
-func (r *Reconciler) fetchRemote() (string, error) {
-	if err := r.ensureRepo(); err != nil {
-		return "", err
+// fetchRemote fetches the branch and returns its head, and whether the
+// clone had to be replaced because it tracked another repo or subfolder.
+func (r *Reconciler) fetchRemote() (remote string, stale bool, err error) {
+	if stale, err = r.ensureRepo(); err != nil {
+		return "", stale, err
 	}
 	if _, err := r.git("fetch", "origin", r.opts.Branch); err != nil {
-		return "", err
+		return "", stale, err
 	}
-	remote, err := r.git("rev-parse", "origin/"+r.opts.Branch)
+	out, err := r.git("rev-parse", "origin/"+r.opts.Branch)
 	if err != nil {
-		return "", err
+		return "", stale, err
 	}
-	return strings.TrimSpace(remote), nil
+	return strings.TrimSpace(out), stale, nil
+}
+
+// hasCommit reports whether sha is a commit in the clone.
+func (r *Reconciler) hasCommit(sha string) bool {
+	_, err := r.git("cat-file", "-e", sha+"^{commit}")
+	return err == nil
 }
 
 // atRef returns desired content at a git ref (nil if absent), in the
@@ -522,24 +563,55 @@ func (r *Reconciler) computeLocked(remote string) error {
 func (r *Reconciler) Tick() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	remote, err := r.fetchRemote()
+	remote, stale, err := r.fetchRemote()
 	if err != nil {
 		return err
 	}
-	if r.state.AppliedSHA == "" {
-		// First run: baseline only, write nothing. Differences appear for
-		// the human to converge deliberately.
-		r.state.AppliedSHA = remote
-		if err := r.saveState(); err != nil {
-			return err
-		}
-		log.Printf("baselined at %.9s without applying (first run)", remote)
+	if err := r.retargetLocked(remote, stale); err != nil {
+		return err
 	}
 	if err := r.computeLocked(remote); err != nil {
 		return err
 	}
 	r.status.Error = ""
 	r.finishLocked()
+	return nil
+}
+
+// retargetLocked baselines at remote on first run, and again whenever the
+// baseline stopped describing the configured target: repo_url, branch or
+// subfolder changed (state from before targets were recorded counts as
+// changed when its clone was stale), or the applied commit is gone. Like
+// a first run it writes nothing; differences show for a human to converge.
+func (r *Reconciler) retargetLocked(remote string, stale bool) error {
+	id := targetID{RepoURL: r.opts.RepoURL, Branch: r.opts.Branch, Subfolder: r.opts.Subfolder}
+	moved := r.state.AppliedSHA != "" &&
+		((r.state.Target != nil && *r.state.Target != id) ||
+			(r.state.Target == nil && stale) ||
+			!r.hasCommit(r.state.AppliedSHA))
+	if r.state.AppliedSHA != "" && !moved {
+		if r.state.Target == nil {
+			r.state.Target = &id
+			return r.saveState()
+		}
+		return nil
+	}
+	first := r.state.AppliedSHA == ""
+	r.state = persistedState{AppliedSHA: remote, Target: &id}
+	if err := r.saveState(); err != nil {
+		return err
+	}
+	if first {
+		log.Printf("baselined at %.9s without applying (first run)", remote)
+		return nil
+	}
+	log.Printf("target is now %s %s:%s; baselined at %.9s without applying",
+		id.RepoURL, id.Branch, id.Subfolder, remote)
+	r.ha.Persist("GitOps: target changed", fmt.Sprintf(
+		"Now tracking `%s` on branch `%s` in `%s`. The previous last-applied "+
+			"baseline belonged to the old target, so the add-on re-baselined at "+
+			"%.9s without writing anything — every difference between live and "+
+			"the new target shows in the GitOps panel.", id.Subfolder, id.Branch, id.RepoURL, remote))
 	return nil
 }
 
@@ -697,7 +769,7 @@ func (r *Reconciler) applyLocked(want map[string][]byte) error {
 func (r *Reconciler) CommitTarget(picks []Picks, message string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	remote, err := r.fetchRemote()
+	remote, _, err := r.fetchRemote()
 	if err != nil {
 		return err
 	}

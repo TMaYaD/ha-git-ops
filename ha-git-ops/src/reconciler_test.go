@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -14,10 +15,15 @@ import (
 )
 
 // fakeSupervisor answers every Supervisor call; the core check passes.
-type fakeSupervisor struct{ calls []string }
+type fakeSupervisor struct{ bodies []string }
 
 func (f *fakeSupervisor) RoundTrip(req *http.Request) (*http.Response, error) {
-	f.calls = append(f.calls, req.Method+" "+req.URL.Path)
+	call := req.Method + " " + req.URL.Path
+	if req.Body != nil {
+		b, _ := io.ReadAll(req.Body)
+		call += " " + string(b)
+	}
+	f.bodies = append(f.bodies, call)
 	body := "{}"
 	if req.URL.Path == "/core/check" {
 		body = `{"result":"ok"}`
@@ -39,6 +45,7 @@ func run(t *testing.T, dir, script string) string {
 type rig struct {
 	t                  *testing.T
 	r                  *Reconciler
+	sup                *fakeSupervisor
 	work, live, origin string
 }
 
@@ -53,14 +60,15 @@ func newRig(t *testing.T) *rig {
 		t.Fatal(err)
 	}
 	run(t, base, "cp work/ha/a.yaml work/ha/b.yaml live/")
-	ha := &HA{client: &http.Client{Transport: &fakeSupervisor{}}}
+	sup := &fakeSupervisor{}
+	ha := &HA{client: &http.Client{Transport: sup}}
 	r := &Reconciler{
 		opts: Options{RepoURL: filepath.Join(base, "origin.git"), Branch: "main", Subfolder: "ha",
 			CommitName: "ha-git-ops", CommitEmail: "ha@test"},
 		ha: ha, repoDir: filepath.Join(base, "repo"), configDir: live,
 		stateFile: filepath.Join(base, "state.json"), backupsDir: filepath.Join(base, "backups"),
 	}
-	return &rig{t: t, r: r, work: filepath.Join(base, "work"), live: live, origin: filepath.Join(base, "origin.git")}
+	return &rig{t: t, r: r, sup: sup, work: filepath.Join(base, "work"), live: live, origin: filepath.Join(base, "origin.git")}
 }
 
 func (g *rig) tick() {
@@ -194,5 +202,135 @@ func TestMaskLine(t *testing.T) {
 		if maskLine(key, keep) != keep {
 			t.Fatalf("%q should pass through", keep)
 		}
+	}
+}
+
+// restart simulates an add-on restart with changed options: a fresh
+// reconciler over the same /data, loading persisted state.
+func (g *rig) restart(change func(*Options)) {
+	g.t.Helper()
+	old := g.r
+	r := &Reconciler{opts: old.opts, ha: old.ha, repoDir: old.repoDir, configDir: old.configDir,
+		stateFile: old.stateFile, backupsDir: old.backupsDir}
+	change(&r.opts)
+	if raw, err := os.ReadFile(r.stateFile); err == nil {
+		if err := json.Unmarshal(raw, &r.state); err != nil {
+			g.t.Fatal(err)
+		}
+	}
+	g.r = r
+}
+
+func (g *rig) gitOut(args ...string) string {
+	g.t.Helper()
+	out, err := g.r.git(args...)
+	if err != nil {
+		g.t.Fatal(err)
+	}
+	return strings.TrimSpace(out)
+}
+
+func (g *rig) notified(title string) bool {
+	for _, c := range g.sup.bodies {
+		if strings.Contains(c, title) {
+			return true
+		}
+	}
+	return false
+}
+
+// The bug this guards: after moving the config to another repo, branch
+// and folder, the old clone kept fetching from the old origin and the
+// old baseline was diffed against the new paths.
+func TestRetargetToMovedConfig(t *testing.T) {
+	g := newRig(t)
+	g.tick()
+	old := g.r.state.AppliedSHA
+
+	base := filepath.Dir(g.work)
+	run(t, base, `git init -q --bare -b main moved.git && git init -q -b ha moved &&
+		cd moved && git config user.email t@t && git config user.name t && mkdir config &&
+		printf 'a1\na2\na3\n' > config/a.yaml && printf 'b1\nb2\nb3\n' > config/b.yaml &&
+		git add -A && git commit -qm moved && git push -q ../moved.git ha`)
+	g.restart(func(o *Options) {
+		o.RepoURL, o.Branch, o.Subfolder = filepath.Join(base, "moved.git"), "ha", "config"
+	})
+	g.tick()
+
+	if got := g.gitOut("remote", "get-url", "origin"); got != filepath.Join(base, "moved.git") {
+		t.Fatalf("origin = %s", got)
+	}
+	if got := g.gitOut("sparse-checkout", "list"); got != "config" {
+		t.Fatalf("sparse = %s", got)
+	}
+	head := g.r.status.TargetSHA
+	want := targetID{RepoURL: filepath.Join(base, "moved.git"), Branch: "ha", Subfolder: "config"}
+	if g.r.state.AppliedSHA != head || head == old || g.r.state.Target == nil || *g.r.state.Target != want {
+		t.Fatalf("want baseline at new head with new target, got %+v", g.r.state)
+	}
+	// Only b.yaml differs (live lacks b3), and against the new baseline it
+	// reads as a live change, not a full deletion plus a full addition.
+	if len(g.r.status.Files) != 1 || g.file("b.yaml").Kind != kindLive {
+		t.Fatalf("files = %+v", g.r.status.Files)
+	}
+	if !g.notified("GitOps: target changed") {
+		t.Fatal("expected a target-changed notification")
+	}
+}
+
+func TestRetargetBranchOnly(t *testing.T) {
+	g := newRig(t)
+	g.tick()
+	old := g.r.state.AppliedSHA
+	run(t, g.work, `git checkout -qb next && printf 'b1\nB2\n' > ha/b.yaml &&
+		git commit -qam next && git push -q ../origin.git next`)
+	g.restart(func(o *Options) { o.Branch = "next" })
+	g.tick()
+	if g.r.state.AppliedSHA == old || g.r.state.AppliedSHA != g.r.status.TargetSHA || g.r.state.Target.Branch != "next" {
+		t.Fatalf("want baseline at next's head, got %+v", g.r.state)
+	}
+}
+
+// State written before targets were recorded: a stale clone means the
+// options moved, a matching one keeps its baseline.
+func TestRetargetLegacyState(t *testing.T) {
+	g := newRig(t)
+	g.tick()
+	old := g.r.state.AppliedSHA
+	legacy := func() {
+		if err := os.WriteFile(g.r.stateFile, []byte(`{"applied_sha":"`+old+`"}`), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	legacy()
+	g.restart(func(*Options) {})
+	g.tick()
+	if g.r.state.AppliedSHA != old || g.r.state.Target == nil || g.r.state.Target.Subfolder != "ha" {
+		t.Fatalf("matching clone should keep its baseline, got %+v", g.r.state)
+	}
+
+	run(t, g.work, `mkdir -p ha2 && git mv ha/a.yaml ha2/a.yaml && printf 'b1\nb2\n' > ha2/b.yaml &&
+		git add -A && git commit -qm move && git push -q ../origin.git main`)
+	legacy()
+	g.restart(func(o *Options) { o.Subfolder = "ha2" })
+	g.tick()
+	if g.r.state.AppliedSHA == old || g.gitOut("sparse-checkout", "list") != "ha2" {
+		t.Fatalf("stale legacy clone should re-clone and re-baseline, got %+v", g.r.state)
+	}
+}
+
+func TestLostCloneKeepsBaseline(t *testing.T) {
+	g := newRig(t)
+	g.tick()
+	old := g.r.state.AppliedSHA
+	run(t, g.work, `printf 'b1\nB2\n' > ha/b.yaml && git commit -qam up && git push -q ../origin.git main`)
+	if err := os.RemoveAll(g.r.repoDir); err != nil {
+		t.Fatal(err)
+	}
+	g.restart(func(*Options) {})
+	g.tick()
+	if g.r.state.AppliedSHA != old || g.file("b.yaml").Kind != kindTarget {
+		t.Fatalf("a re-clone of the same target must keep the baseline, got %+v", g.r.state)
 	}
 }

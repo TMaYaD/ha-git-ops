@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.1
+
+- **Changing `repo_url`, `branch` or `subfolder` now takes effect.**
+  Previously the existing clone in `/data/repo` was reused as-is: it
+  kept fetching from the old origin with the old sparse checkout, and
+  the old last-applied baseline was diffed against the new paths — so a
+  moved config showed every file as deleted on one side and added on the
+  other. On start the add-on now replaces a clone that tracks a
+  different repo or subfolder, and when the target changes it
+  re-baselines at the new head exactly like a first run: nothing is
+  written, every difference shows in the panel, and a persistent
+  notification says so. The baseline's target is recorded in
+  `state.json`; state from earlier versions counts as moved when its
+  clone was stale. A clone that is merely missing is re-cloned without
+  touching the baseline.
+- A leading or trailing `/` in `subfolder` is ignored instead of
+  breaking every git lookup.
+
 ## 0.6.0
 
 - **Three-way panel.** Every file that needs a decision is one card

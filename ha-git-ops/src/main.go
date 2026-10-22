@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -39,6 +40,9 @@ func main() {
 	if opts.PollInterval < 30 {
 		opts.PollInterval = 120
 	}
+	// Paths are joined as subfolder + "/" + rel; a stray slash would break
+	// every git lookup.
+	opts.Subfolder = strings.Trim(opts.Subfolder, "/")
 
 	ha := NewHA()
 	ha.NotifyService = opts.NotifyService
