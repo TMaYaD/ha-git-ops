@@ -17,6 +17,12 @@ package main
 // human reviewed and are refused if any of them changed since. On first
 // run nothing is written: remote HEAD becomes the baseline and every
 // difference shows up for the human to converge deliberately.
+//
+// The panel can switch the target to another branch — a pull request,
+// say — to pull its changes into live. Last-applied stays anchored to the
+// tracked branch: nothing is recorded while another branch is the
+// target, so once back on the tracked branch, what was pulled shows as
+// live changes until that branch is merged.
 
 import (
 	"bytes"
@@ -32,6 +38,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/TMaYaD/ha-git-ops/diff3"
@@ -82,6 +89,7 @@ type FileState struct {
 
 type Status struct {
 	Files           []FileState
+	Branch          string // the target branch Files were computed against
 	TargetSHA       string
 	Error           string
 	RestartRequired bool
@@ -134,7 +142,17 @@ type Reconciler struct {
 	state    persistedState
 	status   Status
 	notified map[string]bool // rels covered by the current drift notification
+	// view is the branch the panel switched the target to; "" for the
+	// tracked branch. It isn't persisted: a restart is back on the tracked
+	// branch.
+	view string
+	seen atomic.Int64 // unix nanos of the last panel request
 }
+
+// viewIdle is how long the panel may be away before the target falls back
+// from another branch to the tracked one, so drift reporting — off while
+// another branch is the target — doesn't stay off behind a forgotten tab.
+const viewIdle = 10 * time.Minute
 
 func NewReconciler(opts Options, ha *HA) *Reconciler {
 	r := &Reconciler{
@@ -173,6 +191,18 @@ func (r *Reconciler) Snapshot() (Status, string, int) {
 func (r *Reconciler) target() targetID {
 	return targetID{RepoURL: r.opts.RepoURL, Branch: r.opts.Branch, Subfolder: r.opts.Subfolder}
 }
+
+// targetBranch is the branch shown as target: the tracked one, or the one
+// the panel switched to.
+func (r *Reconciler) targetBranch() string {
+	if r.view != "" {
+		return r.view
+	}
+	return r.opts.Branch
+}
+
+// Seen records panel activity, which keeps a switched target alive.
+func (r *Reconciler) Seen() { r.seen.Store(time.Now().UnixNano()) }
 
 func (r *Reconciler) SetError(msg string) {
 	r.mu.Lock()
@@ -381,15 +411,16 @@ func (r *Reconciler) migrateLegacy(from targetID) error {
 	return r.saveState()
 }
 
-// fetchRemote fetches the branch and returns its head.
-func (r *Reconciler) fetchRemote() (string, error) {
+// fetchRemote fetches branch and returns its head.
+func (r *Reconciler) fetchRemote(branch string) (string, error) {
 	if err := r.ensureRepo(); err != nil {
 		return "", err
 	}
-	if _, err := r.git("fetch", "origin", r.opts.Branch); err != nil {
+	tracking := "refs/remotes/origin/" + branch
+	if _, err := r.git("fetch", "origin", "+refs/heads/"+branch+":"+tracking); err != nil {
 		return "", err
 	}
-	remote, err := r.git("rev-parse", "origin/"+r.opts.Branch)
+	remote, err := r.git("rev-parse", tracking)
 	if err != nil {
 		return "", err
 	}
@@ -691,10 +722,13 @@ func (r *Reconciler) fileState(rel, remote string) FileState {
 	return fs
 }
 
-// computeLocked rebuilds the per-file state against remote. A file whose
-// live content matches target is in sync, so that content is now its
-// last-applied; once no file is behind remote, AppliedSHA moves there.
+// computeLocked rebuilds the per-file state against remote, the head of
+// the target branch. On the tracked branch, a file whose live content
+// matches target is in sync, so that content is now its last-applied;
+// once no file is behind remote, AppliedSHA moves there. Another branch
+// moves neither.
 func (r *Reconciler) computeLocked(remote string) error {
+	tracked := r.view == ""
 	rels, err := r.managedRels(remote)
 	if err != nil {
 		return err
@@ -715,7 +749,7 @@ func (r *Reconciler) computeLocked(remote string) error {
 	for _, rel := range rels {
 		fs := r.fileState(rel, remote)
 		if fs.Kind == "" {
-			if !same(fs.Base, fs.Target) || fs.BaseMoved {
+			if tracked && (!same(fs.Base, fs.Target) || fs.BaseMoved) {
 				if err := r.applied(rel, remote); err != nil {
 					return err
 				}
@@ -728,7 +762,7 @@ func (r *Reconciler) computeLocked(remote string) error {
 		}
 		files = append(files, fs)
 	}
-	if !behind && r.state.AppliedSHA != remote {
+	if tracked && !behind && r.state.AppliedSHA != remote {
 		// Nothing user-visible would change by moving the baseline (e.g. a
 		// sops re-encryption to the same plaintext, or commits live already
 		// matches): fast-forward without touching HA.
@@ -743,6 +777,7 @@ func (r *Reconciler) computeLocked(remote string) error {
 		}
 	}
 	r.status.Files = files
+	r.status.Branch = r.targetBranch()
 	r.status.TargetSHA = remote
 	return nil
 }
@@ -753,18 +788,100 @@ func (r *Reconciler) computeLocked(remote string) error {
 func (r *Reconciler) Tick() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	remote, err := r.fetchRemote()
+	if r.view != "" && time.Since(time.Unix(0, r.seen.Load())) > viewIdle {
+		log.Printf("panel idle: target back from %s to %s", r.view, r.opts.Branch)
+		r.view = ""
+	}
+	return r.tickLocked()
+}
+
+// tickLocked fetches and recomputes. The baseline is always taken on the
+// tracked branch; a switched target whose branch is gone (a merged and
+// deleted pull request) falls back to it.
+func (r *Reconciler) tickLocked() error {
+	tracked, err := r.fetchRemote(r.opts.Branch)
 	if err != nil {
 		return err
 	}
-	if err := r.baselineLocked(remote); err != nil {
+	if err := r.baselineLocked(tracked); err != nil {
 		return err
+	}
+	remote, note := tracked, ""
+	if r.view != "" {
+		if head, err := r.fetchRemote(r.view); err == nil {
+			remote = head
+		} else {
+			log.Printf("target %s unavailable, back to %s: %v", r.view, r.opts.Branch, err)
+			note = fmt.Sprintf("%s could not be fetched, so the target is back on %s: %v", r.view, r.opts.Branch, err)
+			r.view = ""
+		}
 	}
 	if err := r.computeLocked(remote); err != nil {
 		return err
 	}
-	r.status.Error = ""
+	r.status.Error = note
 	r.finishLocked()
+	return nil
+}
+
+// View switches the target to branch — e.g. a pull request, to pull its
+// changes into live — or back to the tracked branch for branch "" or the
+// tracked one itself. A branch that can't be fetched leaves the target
+// as it was.
+func (r *Reconciler) View(branch string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if branch = strings.TrimSpace(branch); branch == r.opts.Branch {
+		branch = ""
+	}
+	if branch != "" {
+		if err := r.checkBranch(branch); err != nil {
+			return err
+		}
+		if _, err := r.fetchRemote(branch); err != nil {
+			return err
+		}
+	}
+	prev := r.view
+	r.view = branch
+	r.Seen()
+	if err := r.tickLocked(); err != nil {
+		r.view = prev
+		return err
+	}
+	return nil
+}
+
+// Branch is a branch on origin and its head.
+type Branch struct {
+	Name string `json:"name"`
+	SHA  string `json:"sha"`
+}
+
+// Branches lists origin's branches, sorted by name.
+func (r *Reconciler) Branches() ([]Branch, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out, err := r.git("ls-remote", "--heads", "origin")
+	if err != nil {
+		return nil, err
+	}
+	var bs []Branch
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		f := strings.Fields(line)
+		if len(f) == 2 && strings.HasPrefix(f[1], "refs/heads/") {
+			bs = append(bs, Branch{Name: strings.TrimPrefix(f[1], "refs/heads/"), SHA: f[0]})
+		}
+	}
+	sort.Slice(bs, func(i, j int) bool { return bs[i].Name < bs[j].Name })
+	return bs, nil
+}
+
+func (r *Reconciler) checkBranch(branch string) error {
+	// Outside the clone, which may not exist yet.
+	if err := exec.Command("git", "check-ref-format", "refs/heads/"+branch).Run(); err != nil || strings.HasPrefix(branch, "-") {
+		return fmt.Errorf("invalid branch name %q", branch)
+	}
 	return nil
 }
 
@@ -823,10 +940,14 @@ func (r *Reconciler) baselineLocked(remote string) error {
 	return r.saveState()
 }
 
-// finishLocked publishes the recomputed state.
+// finishLocked publishes the recomputed state. Drift is reported against
+// the tracked branch only; another branch as target leaves the sensor and
+// notification as they were.
 func (r *Reconciler) finishLocked() {
-	r.publish()
-	r.notifyDrift()
+	if r.view == "" {
+		r.publish()
+		r.notifyDrift()
+	}
 	r.status.LastSync = time.Now().Format("2006-01-02 15:04:05")
 }
 
@@ -892,10 +1013,14 @@ func (r *Reconciler) ApplyLive(picks []Picks) error {
 }
 
 // AutoApply applies target to every file only git changed — the
-// auto_apply policy. Files changed live are left for a human.
+// auto_apply policy. Files changed live are left for a human, and so is
+// everything while the target is another branch than the tracked one.
 func (r *Reconciler) AutoApply() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.view != "" {
+		return nil
+	}
 	remote := r.status.TargetSHA
 	want := map[string][]byte{}
 	for _, f := range r.status.Files {
@@ -983,29 +1108,43 @@ func (r *Reconciler) CommitBranch() string {
 
 // CommitTarget commits the staged target buffer — each file's target
 // content with the picked rows taken from live — and pushes it to branch
-// ("" for CommitBranch). Any branch other than the target is a proposal
-// (see propose): the target doesn't move, so the files keep showing as
-// live changes until the branch is merged.
+// ("" for CommitBranch, or the target branch when the panel switched it).
+// Any branch other than the target is a proposal (see propose): the target
+// doesn't move, so the files keep showing as live changes until the
+// branch is merged.
 func (r *Reconciler) CommitTarget(picks []Picks, message, branch string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	target := r.targetBranch()
 	if branch = strings.TrimSpace(branch); branch == "" {
 		branch = r.CommitBranch()
+		if r.view != "" {
+			branch = r.view
+		}
 	}
-	remote, err := r.fetchRemote()
+	if r.view != "" && branch == r.opts.Branch {
+		// The commit would carry the rest of the switched-to branch with it.
+		return fmt.Errorf("the target is %s, so commits build on it — switch the target back to %s to commit there", target, branch)
+	}
+	remote, err := r.fetchRemote(target)
 	if err != nil {
 		return err
 	}
 	if remote != r.status.TargetSHA {
 		return fmt.Errorf("target moved to %.9s: %w", remote, ErrStale)
 	}
-	if _, err := r.git("check-ref-format", "refs/heads/"+branch); err != nil || strings.HasPrefix(branch, "-") {
-		return fmt.Errorf("invalid branch name %q", branch)
+	if err := r.checkBranch(branch); err != nil {
+		return err
+	}
+	if target != r.opts.Branch {
+		// Commits build on the switched-to branch; the clone always ends
+		// back at the tracked one.
+		defer func() { _, _ = r.git("reset", "--hard", "origin/"+r.opts.Branch) }()
 	}
 	// Start from a clean worktree at the remote head so leftovers from a
 	// previously failed commit (staged files, unpushed commits) can't
 	// poison this attempt.
-	if _, err := r.git("reset", "--hard", "origin/"+r.opts.Branch); err != nil {
+	if _, err := r.git("reset", "--hard", "origin/"+target); err != nil {
 		return err
 	}
 	var rels []string
@@ -1031,7 +1170,7 @@ func (r *Reconciler) CommitTarget(picks []Picks, message, branch string) error {
 		if _, err := r.git("commit", "-m", message); err != nil {
 			return err
 		}
-		if branch != r.opts.Branch {
+		if branch != target {
 			err := r.propose(branch, remote, message)
 			// The commit was only a vehicle; the clone stays at the target.
 			_, _ = r.git("reset", "--hard", "origin/"+r.opts.Branch)
@@ -1039,7 +1178,7 @@ func (r *Reconciler) CommitTarget(picks []Picks, message, branch string) error {
 				return err
 			}
 		} else {
-			if _, err := r.git("push", "origin", "HEAD:"+r.opts.Branch); err != nil {
+			if _, err := r.git("push", "origin", "HEAD:"+target); err != nil {
 				_, _ = r.git("reset", "--hard", "origin/"+r.opts.Branch)
 				return fmt.Errorf("push failed, worktree reset — refresh and retry: %v", err)
 			}
@@ -1101,7 +1240,7 @@ func (r *Reconciler) propose(branch, remote, message string) error {
 	if _, err := r.git("push", "origin", commit+":"+ref); err != nil {
 		return fmt.Errorf("push to %s failed — refresh and retry: %v", branch, err)
 	}
-	log.Printf("committed %.9s to %s (target %s unchanged)", commit, branch, r.opts.Branch)
+	log.Printf("committed %.9s to %s (target %s unchanged)", commit, branch, r.targetBranch())
 	return nil
 }
 

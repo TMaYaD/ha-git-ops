@@ -39,7 +39,8 @@ three versions:
 
 - **last-applied** — the git content HA was last in sync with
 - **live** — what Home Assistant runs now
-- **target** — the head of `branch`
+- **target** — the head of `branch`, or of another branch you switch to
+  (see *Pulling from another branch*)
 
 A file is *live changed*, *target changed* or *both changed* depending
 on which side moved away from last-applied. The version cards toggle
@@ -94,6 +95,27 @@ instead of committing to `branch` directly:
 - `branch` stays the target, so the promoted lines keep showing as live
   changes (and in the drift notification) until the PR is merged; the
   next refresh after the merge finds them in sync.
+
+### Pulling from another branch
+
+The target card's `branch @ commit` opens into a list of the repo's
+branches. Pick one — a pull request, say — and it becomes the target, so
+its changes can be staged into live and applied like any git change,
+before or without merging it. Back on `branch` (the banner's link, or
+the same list) the target is the tracked branch again.
+
+- Last-applied stays anchored to `branch`: nothing applied from another
+  branch is recorded as last-applied. Back on `branch`, what you pulled
+  shows as live changes until the branch is merged, then converges.
+- **Commit & push** builds on the branch you switched to and pushes there
+  by default (or proposes onto another branch you name). It won't commit
+  to `branch` itself — that commit would carry the rest of the switched
+  branch with it; switch back first.
+- While another branch is the target, `auto_apply` does nothing and the
+  drift notification and sensor keep their last state.
+- The switch lasts while the panel is in use. After 10 minutes without
+  the panel open, on an add-on restart, or when the branch is deleted
+  (a merged PR), the target falls back to `branch`.
 
 ## Behavior
 

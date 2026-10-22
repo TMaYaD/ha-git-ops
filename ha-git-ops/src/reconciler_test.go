@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/TMaYaD/ha-git-ops/diff3"
 )
@@ -566,5 +567,88 @@ func TestCommitToOtherBranch(t *testing.T) {
 
 	if err := g.r.CommitTarget(nil, "", "bad..name"); err == nil || !strings.Contains(err.Error(), "invalid branch") {
 		t.Fatalf("want an invalid branch error, got %v", err)
+	}
+}
+
+func TestPullFromOtherBranch(t *testing.T) {
+	g := newRig(t)
+	g.tick()
+	main0 := g.originRev("main")
+	base0 := g.r.state.Baseline["a.yaml"]
+	run(t, g.work, `git checkout -qb feature && printf 'a1\na2\nA3\n' > ha/a.yaml &&
+		git commit -qam feature && git push -q ../origin.git feature && git checkout -q main`)
+	feature0 := g.originRev("feature")
+
+	bs, err := g.r.Branches()
+	if err != nil || len(bs) != 2 || bs[0] != (Branch{"feature", feature0}) || bs[1].Name != "main" {
+		t.Fatalf("branches = %+v, %v", bs, err)
+	}
+	if err := g.r.View("nope"); err == nil || g.r.view != "" {
+		t.Fatalf("an unknown branch is refused and keeps the target, got %v", err)
+	}
+	if err := g.r.View("feature"); err != nil {
+		t.Fatal(err)
+	}
+	if g.r.status.Branch != "feature" || g.r.status.TargetSHA != feature0 || g.kind("a.yaml") != kindTarget {
+		t.Fatalf("want feature as target, got %+v", g.r.status)
+	}
+
+	// Pulling feature's line into live records nothing as last-applied.
+	if err := g.r.ApplyLive([]Picks{picksWhere(g.file("a.yaml"), diff3.Live, diff3.Target)}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(g.live, "a.yaml")); string(got) != "a1\na2\nA3\n" {
+		t.Fatalf("live a.yaml = %q", got)
+	}
+	if len(g.r.status.Files) != 0 || g.r.state.Baseline["a.yaml"] != base0 || g.r.state.AppliedSHA != main0 {
+		t.Fatalf("want in sync with feature and last-applied untouched, got %+v %+v", g.r.status.Files, g.r.state)
+	}
+
+	// Commits build on feature and go there by default; never to main.
+	if err := os.WriteFile(filepath.Join(g.live, "a.yaml"), []byte("A1\na2\nA3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	g.tick()
+	promote := picksWhere(g.file("a.yaml"), diff3.Target, diff3.Live)
+	if err := g.r.CommitTarget([]Picks{promote}, "", "main"); err == nil || !strings.Contains(err.Error(), "switch the target back") {
+		t.Fatalf("want commits to main refused, got %v", err)
+	}
+	if err := g.r.CommitTarget([]Picks{promote}, "A1", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := run(t, g.work, "git --git-dir=../origin.git show feature:ha/a.yaml"); got != "A1\na2\nA3" {
+		t.Fatalf("feature a.yaml = %q", got)
+	}
+	if g.originRev("feature^") != feature0 || g.originRev("main") != main0 || g.gitOut("rev-parse", "HEAD") != main0 {
+		t.Fatal("want one commit on feature, main and the clone untouched")
+	}
+	if g.r.status.TargetSHA != g.originRev("feature") || len(g.r.status.Files) != 0 {
+		t.Fatalf("want in sync with the new feature head, got %+v", g.r.status)
+	}
+
+	// Back on main, what was pulled is a live change.
+	if err := g.r.View(""); err != nil {
+		t.Fatal(err)
+	}
+	if g.r.status.Branch != "main" || g.kind("a.yaml") != kindLive {
+		t.Fatalf("want a.yaml live changed on main, got %+v", g.r.status)
+	}
+
+	// An idle panel, or a deleted branch, falls back to main.
+	if err := g.r.View("feature"); err != nil {
+		t.Fatal(err)
+	}
+	g.r.seen.Store(time.Now().Add(-viewIdle - time.Minute).UnixNano())
+	g.tick()
+	if g.r.view != "" || g.r.status.Branch != "main" {
+		t.Fatalf("want main after idling, got %q", g.r.status.Branch)
+	}
+	if err := g.r.View("feature"); err != nil {
+		t.Fatal(err)
+	}
+	run(t, g.work, "git push -q ../origin.git :feature")
+	g.tick()
+	if g.r.status.Branch != "main" || !strings.Contains(g.r.status.Error, "back on main") {
+		t.Fatalf("want main with a note, got %q %q", g.r.status.Branch, g.r.status.Error)
 	}
 }

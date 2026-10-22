@@ -87,9 +87,22 @@ button:focus-visible { outline: 2px solid var(--primary); outline-offset: 1px; }
   background: transparent; border-radius: 12px; padding: 10px 14px; display: flex; gap: 10px;
   align-items: flex-start; min-height: 44px;
 }
-.ver[aria-pressed="true"] { border-style: solid; background: var(--card); }
-.ver[aria-pressed="false"] .vtext { opacity: .7; }
-.ver[disabled] { cursor: default; }
+.ver.on { border-style: solid; background: var(--card); }
+.ver:not(.on) .vtext { opacity: .7; }
+.ver.locked { cursor: default; }
+.ver .vn { background: none; border: 0; padding: 0; color: inherit; cursor: inherit; }
+.vbranch {
+  font: 500 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: var(--text);
+  background: var(--code-bg); border: 1px solid var(--border); border-radius: 5px; padding: 0 6px;
+  min-height: 24px; max-width: 100%; display: inline-flex; align-items: center; gap: 4px;
+  cursor: pointer; vertical-align: middle; overflow-wrap: anywhere; text-align: left;
+}
+.vbranch:hover { border-color: var(--target-sw); }
+.vbranch.other { color: var(--target); background: var(--target-bg); border-color: var(--target-sw); }
+.vbranch svg { flex: none; color: var(--muted); }
+select.vbranch { padding: 2px 4px; }
+.banner .linkbtn { color: inherit; text-decoration: underline; padding: 0 4px; min-height: 0; }
+.banner code { font-size: 13px; }
 .sw { width: 10px; height: 10px; border-radius: 3px; margin-top: 6px; flex: none; }
 .sw.base { background: var(--base-sw); }
 .sw.live { background: var(--live-sw); }
@@ -301,7 +314,8 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
     anchor: null, // last clicked line, for shift-click ranges
     open: {},     // expanded folds
     busy: '',
-    notice: null  // { text, bad }
+    notice: null, // { text, bad }
+    branches: null // open branch menu: { list } (null while loading)
   };
   if (['base', 'live', 'target'].filter(function (k) { return S.show[k]; }).length < 2) {
     S.show = { base: false, live: true, target: true };
@@ -504,14 +518,85 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
     act('Committing…', 'POST', 'api/commit', { message: msgBox.value.trim(), branch: branch, files: files },
       { key: 'target', rels: files.map(function (f) { return f.rel; }) },
       'Committed and pushed ' + plural(files.length, 'file') + ' to ' + branch +
-        (branch === S.data.branch ? '.' : ' — open a pull request into ' + S.data.branch + '.'),
+        (branch === targetBranch() ? '.' : ' — open a pull request into ' + targetBranch() + '.'),
       function () { msgBox.value = ''; });
   }
   function doRefresh() { act('Refreshing…', 'POST', 'api/refresh', null, null, null); }
 
+  // ---------- target branch ----------
+
+  // The target can be switched to any branch on origin — a pull request,
+  // say — to pull its changes into live. Last-applied stays on the
+  // tracked branch, so back there the pulled lines show as live changes
+  // until the branch is merged. Staging carries over where it still fits.
+  function targetBranch() { return S.data.targetBranch || S.data.branch; }
+  function openBranches() {
+    if (S.busy) return;
+    S.branches = { list: null };
+    render();
+    request('GET', 'api/branches').then(function (data) {
+      if (S.branches) S.branches.list = data.branches || [];
+    }).catch(function (err) {
+      S.branches = null;
+      S.notice = { bad: true, text: 'Could not list branches: ' + err.message };
+    }).then(function () {
+      render();
+      var sel = document.getElementById('branch-select');
+      if (!sel) return;
+      sel.focus();
+      try { sel.showPicker(); } catch (e) { /* opened by the next click instead */ }
+    });
+  }
+  function closeBranches() {
+    if (!S.branches) return;
+    S.branches = null;
+    render();
+    var b = document.getElementById('branch-button');
+    if (b) b.focus();
+  }
+  function switchTarget(name) {
+    S.branches = null;
+    if (name === targetBranch()) { render(); return; }
+    branchBox.value = ''; // commits follow the target unless told otherwise
+    act('Switching the target to ' + name + '…', 'POST', 'api/view', { branch: name }, null,
+      name === S.data.branch ? 'The target is back on ' + name + '.'
+        : 'The target is now ' + name + '. Stage its lines into live to pull them into Home Assistant.');
+  }
+  // branchCtl is the target's branch @ commit: a button that opens into a
+  // select of origin's branches.
+  function branchCtl() {
+    var cur = targetBranch(), tracked = S.data.branch;
+    if (!S.branches) {
+      return h('button', {
+        type: 'button', id: 'branch-button', class: 'vbranch' + (cur !== tracked ? ' other' : ''), disabled: !!S.busy,
+        title: 'Switch the target to another branch', 'aria-label': 'Target ' + cur + ' at ' + short(S.data.targetSha) + ' — switch branch',
+        onclick: openBranches
+      }, cur + ' @ ' + short(S.data.targetSha), ICON.caret());
+    }
+    var list = S.branches.list;
+    var opts = list === null ? [h('option', { value: cur, text: 'Loading branches…' })] : (function () {
+      var seen = {}, rows = [];
+      list.forEach(function (b) { seen[b.name] = true; });
+      if (!seen[cur]) rows.push({ name: cur, sha: S.data.targetSha });
+      rows = rows.concat(list).sort(function (a, b) {
+        return (b.name === tracked) - (a.name === tracked) || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+      });
+      return rows.map(function (b) {
+        return h('option', { value: b.name, selected: b.name === cur,
+          text: b.name + ' @ ' + short(b.sha) + (b.name === tracked ? ' · tracked' : '') });
+      });
+    })();
+    return h('select', {
+      id: 'branch-select', class: 'vbranch', 'aria-label': 'Target branch', disabled: list === null,
+      onchange: function (ev) { switchTarget(ev.target.value); },
+      onkeydown: function (ev) { if (ev.key === 'Escape') { ev.preventDefault(); closeBranches(); } },
+      onblur: function () { setTimeout(function () { if (S.branches && S.branches.list) closeBranches(); }, 0); }
+    }, opts);
+  }
+
   // Pick up background refreshes; staging is rebuilt on changed files.
   setInterval(function () {
-    if (S.busy || document.hidden) return;
+    if (S.busy || S.branches || document.hidden) return;
     request('GET', 'api/state').then(function (data) {
       if (!S.busy && JSON.stringify(data) !== JSON.stringify(S.data)) { ingest(data, null); render(); }
     }).catch(function () { /* next poll */ });
@@ -562,6 +647,7 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
     file: function () { return svg(14, 14, '0 0 24 24', [['path', { d: 'M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z' }], ['polyline', { points: '14 2 14 8 20 8' }]]); },
     minus: function () { return svg(14, 14, '0 0 24 24', [['line', { x1: 5, y1: 12, x2: 19, y2: 12 }]]); },
     refresh: function () { return svg(16, 16, '0 0 24 24', [['path', { d: 'M21 12a9 9 0 1 1-2.64-6.36' }], ['polyline', { points: '21 3 21 9 15 9' }]]); },
+    caret: function () { return svg(10, 10, '0 0 10 10', [['polyline', { points: '2 3.5 5 6.5 8 3.5' }]]); },
     brand: function () { return svg(22, 22, '0 0 24 24', [['line', { x1: 6, y1: 3, x2: 6, y2: 15 }], ['circle', { cx: 18, cy: 6, r: 3 }], ['circle', { cx: 6, cy: 18, r: 3 }], ['path', { d: 'M18 9a9 9 0 0 1-9 9' }]]); }
   };
   function short(sha) { return sha ? sha.slice(0, 7) : '—'; }
@@ -701,7 +787,7 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
         h('div', { class: 'row names', style: style }, cells(shown, function (v) {
           var n = S.buf[f.rel] ? Object.keys(S.buf[f.rel][v.key] || {}).length : 0;
           return h('div', { class: 'nm ' + v.key }, v.name,
-            v.key === 'base' ? h('code', { text: short(f.baseSha) }) : v.key === 'target' ? h('code', { text: short(S.data.targetSha) }) : null,
+            v.key === 'base' ? h('code', { text: short(f.baseSha) }) : v.key === 'target' ? h('code', { text: (targetBranch() !== S.data.branch ? targetBranch() + ' @ ' : '') + short(S.data.targetSha) }) : null,
             v.key === 'base' && f.baseMoved ? h('span', { class: 'bufn', text: 'from the previous target' }) : null,
             n ? h('span', { class: 'bufn', text: 'buffer · ' + n + ' staged' }) : null);
         }, function () { return h('div'); })),
@@ -894,11 +980,16 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
   var branchBox = h('input', { id: 'commit-branch', class: 'msg branch', type: 'text', spellcheck: 'false',
     autocomplete: 'off', oninput: syncBranch });
   var branchDir = h('span', { class: 'dir' }), branchHint = h('p', { class: 'empty-hint' });
-  function commitBranch() { return branchBox.value.trim() || S.data.commitBranch || S.data.branch; }
+  // Commits go to commit_branch by default, or to the target when it was
+  // switched to another branch.
+  function defaultCommitBranch() {
+    return targetBranch() !== S.data.branch ? targetBranch() : S.data.commitBranch || S.data.branch;
+  }
+  function commitBranch() { return branchBox.value.trim() || defaultCommitBranch(); }
   // syncBranch updates what depends on the branch in place, keeping focus.
   function syncBranch() {
-    var b = commitBranch(), t = S.data.branch;
-    branchBox.placeholder = S.data.commitBranch || t;
+    var b = commitBranch(), t = targetBranch();
+    branchBox.placeholder = defaultCommitBranch();
     branchDir.textContent = '→ ' + b;
     branchHint.textContent = b === t ? '' :
       'Proposes the change on ' + b + ': ' + t + ' stays the target, so these lines keep showing as changed until ' + b + ' is merged.';
@@ -924,13 +1015,20 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
 
     var banners = [];
     if (d.restartRequired) banners.push(h('p', { class: 'banner warn', text: 'Restart Home Assistant Core to activate the applied changes.' }));
+    if (targetBranch() !== d.branch) {
+      banners.push(h('p', { class: 'banner warn' }, 'The target is ', h('code', { text: targetBranch() }), ', not the tracked ',
+        h('code', { text: d.branch }), '. Lines applied from it don\'t become last-applied: back on ', d.branch,
+        ' they show as live changes until ' + targetBranch() + ' is merged. Drift notifications pause meanwhile.',
+        h('button', { type: 'button', class: 'linkbtn', disabled: !!S.busy, onclick: function () { switchTarget(d.branch); } }, 'Back to ' + d.branch)));
+    }
     if (S.busy) banners.push(h('p', { class: 'banner warn', text: S.busy }));
     if (S.notice) banners.push(h('p', { class: 'banner ' + (S.notice.bad ? 'bad' : 'ok'), role: S.notice.bad ? 'alert' : null, text: S.notice.text }));
 
     var body = [];
     if (!S.files.length) {
       body.push(h('div', { class: 'empty' }, h('p', { class: 'lead', text: 'Everything is in sync' }),
-        h('p', { text: 'Home Assistant matches git — nothing to apply or commit.' })));
+        h('p', { text: 'Home Assistant matches git — nothing to apply or commit.' }),
+        h('p', {}, 'Target ', branchCtl())));
     } else {
       body.push(h('div', { class: 'filters', role: 'group', 'aria-label': 'Filter files' },
         [['all', 'All', S.files.length], ['both', 'both changed', count('both')], ['live', 'live changed', count('live')], ['target', 'target changed', count('target')]]
@@ -952,6 +1050,7 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
         seg('Versions to compare', Object.keys(PAIRS).map(function (k) {
           return [k, VER[PAIRS[k].a].name + ' → ' + VER[PAIRS[k].b].name];
         }), S.pair, function (k) { S.pair = k; save('pair', k); render(); }),
+        h('span', { class: 'hint' }, 'Target ', branchCtl()),
         texts.length ? copyBtn('Copy all', 'Copy the diffs of all ' + plural(texts.length, 'file') + ' shown',
           function () { return texts.join(''); }) : null));
       body.push(h('p', { class: 'hint', text: 'Shows ' + p.hint + ', as a plain diff to read or copy. Staging needs the side-by-side view.' }));
@@ -963,18 +1062,24 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
       var desc = {
         base: ['synced to HA · ', short(d.appliedSha) + (d.movedBaselines ? ' (' + plural(d.movedBaselines, 'file') + ' from the previous target)' : '')],
         live: ['what Home Assistant runs now', null],
-        target: ['desired state · ' + d.branch + ' @ ', short(d.targetSha)]
+        target: ['desired state · ', null]
       };
       body.push(h('div', { class: 'vers', role: 'group', 'aria-label': 'Versions to compare' }, VERS.map(function (v) {
-        var on = !!S.show[v.key], n = 0;
+        var on = !!S.show[v.key], n = 0, locked = on && shown.length <= 2;
         if (v.key !== 'base') Object.keys(S.buf).forEach(function (rel) { n += Object.keys(S.buf[rel][v.key]).length; });
-        return h('button', {
-          type: 'button', class: 'ver', 'aria-pressed': String(on), disabled: on && shown.length <= 2,
-          onclick: function () { S.show[v.key] = !on; save('show', S.show); render(); }
+        // The whole chip toggles the version, through its name button for
+        // the keyboard; the branch control inside it doesn't.
+        return h('div', {
+          class: 'ver' + (on ? ' on' : '') + (locked ? ' locked' : ''),
+          onclick: function (ev) {
+            if (locked || ev.target.closest('.vbranch')) return;
+            S.show[v.key] = !on; save('show', S.show); render();
+          }
         }, h('span', { class: 'sw ' + v.key }), h('span', { class: 'vtext' },
-          h('span', { class: 'vtop' }, h('span', { class: 'vn', text: v.name }), h('span', { class: 'vstate', text: on ? 'shown' : 'hidden' }),
+          h('span', { class: 'vtop' }, h('button', { type: 'button', class: 'vn', 'aria-pressed': String(on), disabled: locked, text: v.name }),
+            h('span', { class: 'vstate', text: on ? 'shown' : 'hidden' }),
             n ? h('span', { class: 'vbuf', text: 'buffer · ' + plural(n, 'line') + ' staged' }) : null),
-          h('span', { class: 'vd' }, desc[v.key][0], desc[v.key][1] ? h('code', { text: desc[v.key][1] }) : null)));
+          h('span', { class: 'vd' }, desc[v.key][0], v.key === 'target' ? branchCtl() : desc[v.key][1] ? h('code', { text: desc[v.key][1] }) : null)));
       })));
       var hiddenNames = VERS.filter(function (v) { return !S.show[v.key]; }).map(function (v) { return v.name; }).join(' and ');
       body.push(h('p', { class: 'hint', text: (shown.length === 3 ? 'Comparing all three versions.'

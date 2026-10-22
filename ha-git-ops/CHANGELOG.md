@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.9.0
+
+- **Pull from another branch.** The target card's `branch @ commit`
+  opens into a list of the repo's branches; pick one — a pull request,
+  say — and it becomes the target, so its lines can be staged into live
+  and applied before (or without) merging it. Last-applied stays on the
+  tracked branch, so back there the pulled lines show as live changes
+  until the branch is merged. Commits build on the switched-to branch and
+  push there by default. `auto_apply` and drift reporting pause while
+  another branch is the target, and it falls back to the tracked branch
+  after 10 minutes without the panel, on a restart, or when the branch is
+  deleted.
+
 ## 0.8.0
 
 - **Commit to another branch.** The target buffer has a branch field, and

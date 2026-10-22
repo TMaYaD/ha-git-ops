@@ -2,7 +2,8 @@
 // in-memory fixture of three-way file states behind the same JSON API as
 // the add-on, so the UI can be exercised — staging, apply, commit —
 // without the reconciler or an HA supervisor. Apply and commit really
-// update the fixture; GET /reset restores it. Re-reads page.html on every
+// update the fixture, and the target can be switched to a couple of other
+// branches; GET /reset restores it. Re-reads page.html on every
 // request, so editing it and refreshing the browser is enough.
 //
 // Usage: go run ./cmd/preview   (from src/), then open http://localhost:8098
@@ -38,6 +39,7 @@ type apiFile struct {
 
 type apiState struct {
 	Branch          string    `json:"branch"`
+	TargetBranch    string    `json:"targetBranch"`
 	CommitBranch    string    `json:"commitBranch"`
 	AppliedSHA      string    `json:"appliedSha"`
 	MovedBaselines  int       `json:"movedBaselines"`
@@ -137,6 +139,12 @@ func fixture() map[string]*file {
 		"      friendly_name: Cooling degree days",
 		"      unit_of_measurement: CDD")
 
+	autoFeature := append(append([]string(nil), autoLive...), "  mode: single")
+	branchTargets = map[string]map[string][]byte{
+		"feature/porch-offset": {"automations.yaml": text(autoFeature...)},
+		"gitops/drift":         {"scripts.yaml": text(scriptsLive...)},
+	}
+
 	return map[string]*file{
 		"GITOPS.md":        {base: text(gitopsBase...), live: nil, target: text(gitopsTarget...)},
 		"scripts.yaml":     {base: text(scripts...), live: text(scriptsLive...), target: text(scriptsTarget...)},
@@ -149,6 +157,16 @@ func fixture() map[string]*file {
 			masked: true,
 		},
 	}
+}
+
+// branchTargets overrides the main target per file on other branches;
+// set by fixture.
+var branchTargets map[string]map[string][]byte
+
+// head is a branch's target content; a rel missing from targets is absent.
+type head struct {
+	sha     string
+	targets map[string][]byte
 }
 
 func same(a, b []byte) bool { return (a == nil) == (b == nil) && string(a) == string(b) }
@@ -170,15 +188,28 @@ type store struct {
 	mu        sync.Mutex
 	files     map[string]*file
 	applied   string
+	view      string // the target branch
 	targetSHA string
+	heads     map[string]*head // every branch but view
 	commits   int
 	lastSync  string
 }
 
 func newStore() *store {
-	s := &store{files: fixture(), applied: "bbcdeb44f0c2", targetSHA: "8770cc5e1a9d"}
+	s := &store{files: fixture(), applied: "bbcdeb44f0c2", view: "main", targetSHA: "8770cc5e1a9d", heads: map[string]*head{}}
 	for _, f := range s.files {
 		f.baseSHA = s.applied
+	}
+	for name, over := range branchTargets {
+		sum := sha256.Sum256([]byte(name))
+		h := &head{sha: hex.EncodeToString(sum[:])[:12], targets: map[string][]byte{}}
+		for rel, f := range s.files {
+			h.targets[rel] = f.target
+		}
+		for rel, t := range over {
+			h.targets[rel] = t
+		}
+		s.heads[name] = h
 	}
 	s.lastSync = time.Now().Format("2006-01-02 15:04:05")
 	return s
@@ -189,7 +220,7 @@ func rows(f *file) []diff3.Row {
 }
 
 func (s *store) state() apiState {
-	st := apiState{Branch: "main", CommitBranch: "main", AppliedSHA: s.applied, TargetSHA: s.targetSHA, LastSync: s.lastSync, Files: []apiFile{}}
+	st := apiState{Branch: "main", TargetBranch: s.view, CommitBranch: "main", AppliedSHA: s.applied, TargetSHA: s.targetSHA, LastSync: s.lastSync, Files: []apiFile{}}
 	rels := make([]string, 0, len(s.files))
 	for rel := range s.files {
 		rels = append(rels, rel)
@@ -245,8 +276,36 @@ func (s *store) write(body apiWrite, col diff3.Col, allowed ...diff3.Col) (map[s
 	return out, 0, nil
 }
 
-// settle advances baselines the way the reconciler does.
+// switchTo makes branch the target, the way Reconciler.View does.
+func (s *store) switchTo(branch string) error {
+	if branch == "" {
+		branch = "main"
+	}
+	if branch == s.view {
+		return nil
+	}
+	next, ok := s.heads[branch]
+	if !ok {
+		return fmt.Errorf("git fetch: fatal: couldn't find remote ref refs/heads/%s", branch)
+	}
+	cur := &head{sha: s.targetSHA, targets: map[string][]byte{}}
+	for rel, f := range s.files {
+		cur.targets[rel] = f.target
+		f.target = next.targets[rel]
+	}
+	s.heads[s.view] = cur
+	delete(s.heads, branch)
+	s.view, s.targetSHA = branch, next.sha
+	s.settle()
+	return nil
+}
+
+// settle advances baselines the way the reconciler does: only on main.
 func (s *store) settle() {
+	s.lastSync = time.Now().Format("2006-01-02 15:04:05")
+	if s.view != "main" {
+		return
+	}
 	behind := false
 	for _, f := range s.files {
 		if same(f.live, f.target) {
@@ -258,7 +317,6 @@ func (s *store) settle() {
 	if !behind {
 		s.applied = s.targetSHA
 	}
-	s.lastSync = time.Now().Format("2006-01-02 15:04:05")
 }
 
 func main() {
@@ -281,14 +339,45 @@ func main() {
 	mux.HandleFunc("GET /reset", func(w http.ResponseWriter, req *http.Request) {
 		fresh := newStore()
 		s.mu.Lock()
-		s.files, s.applied, s.targetSHA, s.commits, s.lastSync =
-			fresh.files, fresh.applied, fresh.targetSHA, fresh.commits, fresh.lastSync
+		s.files, s.applied, s.view, s.targetSHA, s.heads, s.commits, s.lastSync =
+			fresh.files, fresh.applied, fresh.view, fresh.targetSHA, fresh.heads, fresh.commits, fresh.lastSync
 		s.mu.Unlock()
 		http.Redirect(w, req, "./", http.StatusSeeOther)
 	})
 	mux.HandleFunc("GET /api/state", func(w http.ResponseWriter, req *http.Request) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
+		writeJSON(w, http.StatusOK, s.state())
+	})
+	mux.HandleFunc("GET /api/branches", func(w http.ResponseWriter, req *http.Request) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		type branch struct {
+			Name string `json:"name"`
+			SHA  string `json:"sha"`
+		}
+		bs := []branch{{s.view, s.targetSHA}}
+		for name, h := range s.heads {
+			bs = append(bs, branch{name, h.sha})
+		}
+		sort.Slice(bs, func(i, j int) bool { return bs[i].Name < bs[j].Name })
+		time.Sleep(300 * time.Millisecond) // ls-remote is a network round trip
+		writeJSON(w, http.StatusOK, map[string]any{"branches": bs})
+	})
+	mux.HandleFunc("POST /api/view", func(w http.ResponseWriter, req *http.Request) {
+		var body struct {
+			Branch string `json:"branch"`
+		}
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if err := s.switchTo(body.Branch); err != nil {
+			writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error(), "state": s.state()})
+			return
+		}
 		writeJSON(w, http.StatusOK, s.state())
 	})
 	mux.HandleFunc("POST /api/refresh", func(w http.ResponseWriter, req *http.Request) {
@@ -311,7 +400,12 @@ func main() {
 				writeJSON(w, status, map[string]any{"error": err.Error(), "state": s.state()})
 				return
 			}
-			if commit && body.Branch != "" && body.Branch != "main" {
+			if commit && s.view != "main" && body.Branch == "main" {
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "the target is " + s.view +
+					", so commits build on it — switch the target back to main to commit there", "state": s.state()})
+				return
+			}
+			if commit && body.Branch != "" && body.Branch != s.view {
 				// A proposal: the target doesn't move.
 				log.Printf("commit to %s: %q %v", body.Branch, body.Message, len(out))
 				writeJSON(w, http.StatusOK, s.state())
