@@ -1,5 +1,5 @@
 name: HA GitOps
-version: 0.7.0
+version: 0.8.0
 slug: ha_git_ops
 description: ArgoCD-style GitOps reconciler — three-way diffs of last-applied, live and target; stage lines to apply to HA or commit to git
 url: https://github.com/TMaYaD/ha-git-ops
@@ -20,6 +20,7 @@ panel_title: GitOps
 options:
   repo_url: ""
   branch: main
+  commit_branch: ""
   subfolder: home-assistant/config
   poll_interval: 120
   auto_refresh: true
@@ -32,6 +33,7 @@ options:
 schema:
   repo_url: str
   branch: str
+  commit_branch: str
   subfolder: str
   poll_interval: int(30,3600)
   auto_refresh: bool

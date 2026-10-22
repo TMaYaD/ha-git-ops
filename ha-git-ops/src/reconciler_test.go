@@ -151,7 +151,7 @@ func TestThreeWayFlow(t *testing.T) {
 			promote.Rows[i] = diff3.Live
 		}
 	}
-	if err := g.r.CommitTarget([]Picks{promote}, "promote A1"); err != nil {
+	if err := g.r.CommitTarget([]Picks{promote}, "promote A1", ""); err != nil {
 		t.Fatal(err)
 	}
 	if got := run(t, g.work, "git --git-dir=../origin.git show main:ha/a.yaml"); got != "A1\na2\nA3" {
@@ -459,5 +459,112 @@ func TestAccessHint(t *testing.T) {
 	}
 	if h := r.accessHint("fatal: couldn't find remote ref main"); h != "" {
 		t.Fatalf("unrelated errors get no hint, got %q", h)
+	}
+}
+
+// originRev resolves rev in the origin repo, "" if absent.
+func (g *rig) originRev(rev string) string {
+	g.t.Helper()
+	return run(g.t, g.work, "git --git-dir=../origin.git rev-parse --verify -q "+rev+" || true")
+}
+
+func TestCommitToOtherBranch(t *testing.T) {
+	g := newRig(t)
+	g.tick()
+	main0 := g.originRev("main")
+	if err := os.WriteFile(filepath.Join(g.live, "a.yaml"), []byte("A1\na2\nA3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	g.tick()
+	pick := func(line string) Picks {
+		a := g.file("a.yaml")
+		p := Picks{Rel: "a.yaml", Token: a.Token, Rows: map[int]diff3.Col{}}
+		for i, row := range a.Rows {
+			if row[diff3.Live] != nil && *row[diff3.Live] == line {
+				p.Rows[i] = diff3.Live
+			}
+		}
+		return p
+	}
+	show := func(rev string) string {
+		return run(t, g.work, "git --git-dir=../origin.git show "+rev+":ha/a.yaml")
+	}
+
+	// A new branch starts from the target head; the target doesn't move.
+	if err := g.r.CommitTarget([]Picks{pick("A1")}, "propose A1", "gitops/drift"); err != nil {
+		t.Fatal(err)
+	}
+	if g.originRev("main") != main0 || g.r.status.TargetSHA != main0 {
+		t.Fatal("target moved")
+	}
+	if got := show("gitops/drift"); got != "A1\na2\na3" {
+		t.Fatalf("branch a.yaml = %q", got)
+	}
+	if g.originRev("gitops/drift^") != main0 {
+		t.Fatal("branch should start at the target head")
+	}
+	if g.kind("a.yaml") != kindLive || g.gitOut("rev-parse", "HEAD") != main0 {
+		t.Fatalf("want a.yaml still live changed and the clone at the target, got %q", g.kind("a.yaml"))
+	}
+
+	// An open branch grows: promoting more lines keeps what it proposes.
+	if err := g.r.CommitTarget([]Picks{pick("A3")}, "propose A3", "gitops/drift"); err != nil {
+		t.Fatal(err)
+	}
+	if got := show("gitops/drift"); got != "A1\na2\nA3" {
+		t.Fatalf("branch a.yaml = %q", got)
+	}
+	tip := g.originRev("gitops/drift")
+	if g.originRev("gitops/drift~2") != main0 {
+		t.Fatal("want two commits on top of the target head")
+	}
+	// Proposing it again adds nothing.
+	if err := g.r.CommitTarget([]Picks{pick("A3")}, "again", "gitops/drift"); err != nil {
+		t.Fatal(err)
+	}
+	if g.originRev("gitops/drift") != tip {
+		t.Fatal("a repeated proposal should not add a commit")
+	}
+
+	// A conflicting change is refused and leaves the branch alone.
+	if err := os.WriteFile(filepath.Join(g.live, "a.yaml"), []byte("Z1\na2\nA3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	g.tick()
+	if err := g.r.CommitTarget([]Picks{pick("Z1")}, "conflict", "gitops/drift"); err == nil ||
+		!strings.Contains(err.Error(), "already changes the same lines") {
+		t.Fatalf("want a conflict, got %v", err)
+	}
+	if g.originRev("gitops/drift") != tip || g.gitOut("rev-parse", "HEAD") != main0 {
+		t.Fatal("a refused proposal must leave the branch and the clone alone")
+	}
+
+	// Merging the PR converges the file.
+	if err := os.WriteFile(filepath.Join(g.live, "a.yaml"), []byte("A1\na2\nA3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, g.work, "git fetch -q ../origin.git gitops/drift && git merge -q --ff-only FETCH_HEAD && git push -q ../origin.git main")
+	g.tick()
+	if len(g.r.status.Files) != 0 {
+		t.Fatalf("want in sync after the merge, got %+v", g.r.status.Files)
+	}
+
+	// A merged branch starts over from the new target head, by default
+	// through commit_branch.
+	g.r.opts.CommitBranch = "gitops/drift"
+	if err := os.WriteFile(filepath.Join(g.live, "b.yaml"), []byte("b1\nB2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	g.tick()
+	main1 := g.originRev("main")
+	if err := g.r.CommitTarget([]Picks{picksWhere(g.file("b.yaml"), diff3.Target, diff3.Live)}, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if g.originRev("main") != main1 || g.originRev("gitops/drift^") != main1 {
+		t.Fatal("want the merged branch fast-forwarded past the new target head")
+	}
+
+	if err := g.r.CommitTarget(nil, "", "bad..name"); err == nil || !strings.Contains(err.Error(), "invalid branch") {
+		t.Fatalf("want an invalid branch error, got %v", err)
 	}
 }

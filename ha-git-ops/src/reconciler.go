@@ -972,17 +972,35 @@ func (r *Reconciler) applyLocked(want map[string][]byte) error {
 	return nil
 }
 
+// CommitBranch is where commits go unless the panel names another
+// branch: commit_branch, or else the target branch itself.
+func (r *Reconciler) CommitBranch() string {
+	if b := strings.TrimSpace(r.opts.CommitBranch); b != "" {
+		return b
+	}
+	return r.opts.Branch
+}
+
 // CommitTarget commits the staged target buffer — each file's target
-// content with the picked rows taken from live — and pushes it.
-func (r *Reconciler) CommitTarget(picks []Picks, message string) error {
+// content with the picked rows taken from live — and pushes it to branch
+// ("" for CommitBranch). Any branch other than the target is a proposal
+// (see propose): the target doesn't move, so the files keep showing as
+// live changes until the branch is merged.
+func (r *Reconciler) CommitTarget(picks []Picks, message, branch string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if branch = strings.TrimSpace(branch); branch == "" {
+		branch = r.CommitBranch()
+	}
 	remote, err := r.fetchRemote()
 	if err != nil {
 		return err
 	}
 	if remote != r.status.TargetSHA {
 		return fmt.Errorf("target moved to %.9s: %w", remote, ErrStale)
+	}
+	if _, err := r.git("check-ref-format", "refs/heads/"+branch); err != nil || strings.HasPrefix(branch, "-") {
+		return fmt.Errorf("invalid branch name %q", branch)
 	}
 	// Start from a clean worktree at the remote head so leftovers from a
 	// previously failed commit (staged files, unpushed commits) can't
@@ -1013,20 +1031,77 @@ func (r *Reconciler) CommitTarget(picks []Picks, message string) error {
 		if _, err := r.git("commit", "-m", message); err != nil {
 			return err
 		}
-		if _, err := r.git("push", "origin", "HEAD:"+r.opts.Branch); err != nil {
+		if branch != r.opts.Branch {
+			err := r.propose(branch, remote, message)
+			// The commit was only a vehicle; the clone stays at the target.
 			_, _ = r.git("reset", "--hard", "origin/"+r.opts.Branch)
-			return fmt.Errorf("push failed, worktree reset — refresh and retry: %v", err)
+			if err != nil {
+				return err
+			}
+		} else {
+			if _, err := r.git("push", "origin", "HEAD:"+r.opts.Branch); err != nil {
+				_, _ = r.git("reset", "--hard", "origin/"+r.opts.Branch)
+				return fmt.Errorf("push failed, worktree reset — refresh and retry: %v", err)
+			}
+			out, err := r.git("rev-parse", "HEAD")
+			if err != nil {
+				return err
+			}
+			head = strings.TrimSpace(out)
 		}
-		out, err := r.git("rev-parse", "HEAD")
-		if err != nil {
-			return err
-		}
-		head = strings.TrimSpace(out)
 	}
 	if err := r.computeLocked(head); err != nil {
 		return err
 	}
 	r.finishLocked()
+	return nil
+}
+
+// propose pushes HEAD — a commit on the target head remote — to branch,
+// e.g. for a pull request into the target. A new branch, or one the
+// target already contains (a merged PR), starts from that commit. An open
+// branch keeps what it already proposes: the change is merged onto its
+// tip with remote as the merge base, so promoting more lines later adds
+// to the branch instead of reverting earlier proposals.
+func (r *Reconciler) propose(branch, remote, message string) error {
+	out, err := r.git("rev-parse", "HEAD")
+	if err != nil {
+		return err
+	}
+	commit := strings.TrimSpace(out)
+	ref := "refs/heads/" + branch
+	out, err = r.git("ls-remote", "--heads", "origin", ref)
+	if err != nil {
+		return err
+	}
+	if f := strings.Fields(out); len(f) > 0 {
+		tip := f[0]
+		if _, err := r.git("fetch", "origin", ref); err != nil {
+			return err
+		}
+		if _, err := r.git("merge-base", "--is-ancestor", tip, remote); err != nil {
+			// The branch has commits the target lacks: build on them.
+			out, err := r.git("merge-tree", "--write-tree", "--merge-base="+remote, tip, commit)
+			if err != nil {
+				return fmt.Errorf("%s already changes the same lines differently — "+
+					"commit to a new branch, or merge or delete %s first", branch, branch)
+			}
+			tree := strings.Fields(out)[0]
+			if old, _ := r.git("rev-parse", tip+"^{tree}"); strings.TrimSpace(old) == tree {
+				log.Printf("commit: %s already proposes this change", branch)
+				return nil
+			}
+			out, err = r.git("commit-tree", tree, "-p", tip, "-m", message)
+			if err != nil {
+				return err
+			}
+			commit = strings.TrimSpace(out)
+		}
+	}
+	if _, err := r.git("push", "origin", commit+":"+ref); err != nil {
+		return fmt.Errorf("push to %s failed — refresh and retry: %v", branch, err)
+	}
+	log.Printf("committed %.9s to %s (target %s unchanged)", commit, branch, r.opts.Branch)
 	return nil
 }
 

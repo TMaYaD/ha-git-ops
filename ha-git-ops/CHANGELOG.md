@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.0
+
+- **Commit to another branch.** The target buffer has a branch field, and
+  a new `commit_branch` option sets its default (empty commits straight
+  to `branch`, as before). Naming any other branch — existing or new —
+  pushes the commit there instead, so changes can go through a pull
+  request while the add-on keeps tracking `branch`. Commits are built on
+  the head of `branch`; an open branch keeps what it already proposes,
+  with each new change merged onto it, while a new or already-merged one
+  starts fresh. Promoted lines keep showing as live changes until the PR
+  is merged.
+
 ## 0.7.0
 
 - **Unified diff view.** A *Side by side / Unified* toggle in the panel's
