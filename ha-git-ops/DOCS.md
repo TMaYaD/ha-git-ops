@@ -12,6 +12,10 @@
      clone is replaced, and each file keeps what was last applied from the
      previous target — even if that repo no longer exists — until it
      converges on the new one. Nothing is written.
+   - `commit_branch` — where **Commit & push** goes by default; empty
+     commits straight to `branch`. Set it (e.g. `gitops/drift`) to raise
+     pull requests instead of committing to the tracked branch — see
+     *Committing to another branch* below
    - `notify_drift`, `notify_service` — notifications for files awaiting
      a decision, and optional push routing (see Behavior below)
 2. Start it once. The log prints two public keys:
@@ -65,6 +69,24 @@ true`). **Commit & push** commits the target buffer with your message.
 Staging in the other buffer survives either action. A write is refused
 if any of the three versions changed since the panel loaded them —
 refresh and review again.
+
+### Committing to another branch
+
+The target buffer has a branch field, defaulting to `commit_branch` (or
+`branch` when that is empty). Name any other branch — existing or new —
+to propose the change there, e.g. for a pull request into `branch`,
+instead of committing to `branch` directly:
+
+- The commit is always built on the head of `branch`. A new branch, or
+  one `branch` already contains (a merged PR), starts from it.
+- An open branch keeps what it already proposes: the change is merged
+  onto it, so promoting more lines later grows the same PR instead of
+  reverting earlier commits. If the branch already changes the same lines
+  differently the commit is refused — use a new branch, or merge or
+  delete the old one first.
+- `branch` stays the target, so the promoted lines keep showing as live
+  changes (and in the drift notification) until the PR is merged; the
+  next refresh after the merge finds them in sync.
 
 ## Behavior
 

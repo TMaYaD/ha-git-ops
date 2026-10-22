@@ -38,6 +38,7 @@ type apiFile struct {
 
 type apiState struct {
 	Branch          string    `json:"branch"`
+	CommitBranch    string    `json:"commitBranch"`
 	AppliedSHA      string    `json:"appliedSha"`
 	MovedBaselines  int       `json:"movedBaselines"`
 	TargetSHA       string    `json:"targetSha"`
@@ -49,6 +50,7 @@ type apiState struct {
 
 type apiWrite struct {
 	Message string `json:"message"`
+	Branch  string `json:"branch"`
 	Files   []struct {
 		Rel   string            `json:"rel"`
 		Token string            `json:"token"`
@@ -187,7 +189,7 @@ func rows(f *file) []diff3.Row {
 }
 
 func (s *store) state() apiState {
-	st := apiState{Branch: "main", AppliedSHA: s.applied, TargetSHA: s.targetSHA, LastSync: s.lastSync, Files: []apiFile{}}
+	st := apiState{Branch: "main", CommitBranch: "main", AppliedSHA: s.applied, TargetSHA: s.targetSHA, LastSync: s.lastSync, Files: []apiFile{}}
 	rels := make([]string, 0, len(s.files))
 	for rel := range s.files {
 		rels = append(rels, rel)
@@ -307,6 +309,12 @@ func main() {
 			out, status, err := s.write(body, col, allowed...)
 			if err != nil {
 				writeJSON(w, status, map[string]any{"error": err.Error(), "state": s.state()})
+				return
+			}
+			if commit && body.Branch != "" && body.Branch != "main" {
+				// A proposal: the target doesn't move.
+				log.Printf("commit to %s: %q %v", body.Branch, body.Message, len(out))
+				writeJSON(w, http.StatusOK, s.state())
 				return
 			}
 			for rel, content := range out {

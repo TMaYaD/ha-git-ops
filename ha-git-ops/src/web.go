@@ -41,6 +41,7 @@ type apiFile struct {
 
 type apiState struct {
 	Branch          string    `json:"branch"`
+	CommitBranch    string    `json:"commitBranch"` // default for the panel's branch field
 	AppliedSHA      string    `json:"appliedSha"`
 	MovedBaselines  int       `json:"movedBaselines"`
 	TargetSHA       string    `json:"targetSha"`
@@ -58,6 +59,7 @@ type apiPicks struct {
 
 type apiWrite struct {
 	Message string     `json:"message"`
+	Branch  string     `json:"branch"` // commit only; "" for the default
 	Files   []apiPicks `json:"files"`
 }
 
@@ -69,7 +71,7 @@ func NewWebUI(rec *Reconciler, branch string) http.Handler {
 	state := func() apiState {
 		st, applied, moved := rec.Snapshot()
 		out := apiState{
-			Branch: branch, AppliedSHA: applied, MovedBaselines: moved,
+			Branch: branch, CommitBranch: rec.CommitBranch(), AppliedSHA: applied, MovedBaselines: moved,
 			TargetSHA: st.TargetSHA, Error: st.Error,
 			RestartRequired: st.RestartRequired, LastSync: st.LastSync,
 			Files: []apiFile{},
@@ -160,7 +162,7 @@ func NewWebUI(rec *Reconciler, branch string) http.Handler {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		if err := rec.CommitTarget(picks, body.Message); err != nil {
+		if err := rec.CommitTarget(picks, body.Message, body.Branch); err != nil {
 			log.Printf("commit failed: %v", err)
 			fail(w, err)
 			return

@@ -17,6 +17,7 @@ import (
 type Options struct {
 	RepoURL         string `json:"repo_url"`
 	Branch          string `json:"branch"`
+	CommitBranch    string `json:"commit_branch"`
 	Subfolder       string `json:"subfolder"`
 	PollInterval    int    `json:"poll_interval"`
 	AutoRefresh     bool   `json:"auto_refresh"`

@@ -206,6 +206,7 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
 .msg { font: 14px system-ui, sans-serif; border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; background: var(--card); color: var(--text); resize: vertical; min-height: 60px; width: 100%; }
 .msg::placeholder { color: var(--muted); }
 .msg:focus { outline: 2px solid var(--primary); outline-offset: 1px; border-color: transparent; }
+.msg.branch { min-height: 0; resize: none; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; }
 .sec .empty-hint { margin: 0; color: var(--muted); font-size: 12.5px; }
 .tf { display: flex; align-items: center; gap: 6px; font-size: 13px; min-height: 30px; }
 .tf svg { color: var(--muted); flex: none; }
@@ -467,10 +468,11 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
       'Applied ' + plural(files.length, 'file') + ' to live.');
   }
   function doCommit() {
-    var files = stagedFiles('target');
-    act('Committing…', 'POST', 'api/commit', { message: msgBox.value.trim(), files: files },
+    var files = stagedFiles('target'), branch = commitBranch();
+    act('Committing…', 'POST', 'api/commit', { message: msgBox.value.trim(), branch: branch, files: files },
       { key: 'target', rels: files.map(function (f) { return f.rel; }) },
-      'Committed and pushed ' + plural(files.length, 'file') + '.',
+      'Committed and pushed ' + plural(files.length, 'file') + ' to ' + branch +
+        (branch === S.data.branch ? '.' : ' — open a pull request into ' + S.data.branch + '.'),
       function () { msgBox.value = ''; });
   }
   function doRefresh() { act('Refreshing…', 'POST', 'api/refresh', null, null, null); }
@@ -761,6 +763,21 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
   // ---------- rendering: page ----------
 
   var msgBox = h('textarea', { id: 'commit-msg', class: 'msg', rows: '2', placeholder: 'Commit message' });
+  // The branch to commit to; one other than the target is a proposal, e.g.
+  // for a pull request. Kept across commits so a PR can grow.
+  var branchBox = h('input', { id: 'commit-branch', class: 'msg branch', type: 'text', spellcheck: 'false',
+    autocomplete: 'off', oninput: syncBranch });
+  var branchDir = h('span', { class: 'dir' }), branchHint = h('p', { class: 'empty-hint' });
+  function commitBranch() { return branchBox.value.trim() || S.data.commitBranch || S.data.branch; }
+  // syncBranch updates what depends on the branch in place, keeping focus.
+  function syncBranch() {
+    var b = commitBranch(), t = S.data.branch;
+    branchBox.placeholder = S.data.commitBranch || t;
+    branchDir.textContent = '→ ' + b;
+    branchHint.textContent = b === t ? '' :
+      'Proposes the change on ' + b + ': ' + t + ' stays the target, so these lines keep showing as changed until ' + b + ' is merged.';
+    branchHint.hidden = b === t;
+  }
 
   function render() {
     var main = document.getElementById('main'), side = document.getElementById('side');
@@ -886,7 +903,8 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
         tree('live', true)),
       h('section', { class: 'sec', 'aria-label': 'Target buffer' },
         h('div', { class: 'sech' }, h('span', { class: 'sw target' }), h('span', { text: 'Target buffer' }),
-          h('span', { class: 'badge', text: String(nTarget) }), h('span', { class: 'dir', text: '→ ' + (S.data.branch || 'git') })),
+          h('span', { class: 'badge', text: String(nTarget) }), branchDir),
+        h('label', { class: 'sr', for: 'commit-branch', text: 'Branch to commit to' }), branchBox, branchHint,
         h('label', { class: 'sr', for: 'commit-msg', text: 'Commit message' }), msgBox,
         h('button', { type: 'button', class: 'btn' + (nTarget ? ' primary' : ''), disabled: !nTarget || !!S.busy, onclick: doCommit },
           nTarget ? 'Commit & push ' + plural(nTarget, 'line') : 'Commit & push'),
@@ -896,6 +914,7 @@ button.no[aria-pressed="true"] { color: var(--primary); font-weight: 700; }
         h('div', { class: 'sech' }, h('span', { text: 'Unstaged differences' }), h('span', { class: 'badge', text: String(nUn) }),
           h('span', { class: 'dir', text: 'live ≠ target' })),
         unstaged)]);
+    syncBranch();
   }
 
   // Text selection across diff rows selects those lines.
