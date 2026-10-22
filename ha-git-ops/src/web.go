@@ -27,19 +27,23 @@ var page []byte
 
 // API shapes; cmd/preview mirrors them.
 type apiFile struct {
-	Rel     string      `json:"rel"`
-	Kind    string      `json:"kind"`
-	Token   string      `json:"token"`
-	BaseSHA string      `json:"baseSha"`
-	Absent  [3]bool     `json:"absent"` // base, live, target
-	Masked  bool        `json:"masked"`
-	Rows    []diff3.Row `json:"rows"`
+	Rel     string `json:"rel"`
+	Kind    string `json:"kind"`
+	Token   string `json:"token"`
+	BaseSHA string `json:"baseSha"`
+	// BaseSnapshot marks last-applied carried over from before a change
+	// of repo_url or subfolder; BaseSHA is then the commit it came from.
+	BaseSnapshot bool        `json:"baseSnapshot"`
+	Absent       [3]bool     `json:"absent"` // base, live, target
+	Masked       bool        `json:"masked"`
+	Rows         []diff3.Row `json:"rows"`
 }
 
 type apiState struct {
 	Branch          string    `json:"branch"`
 	AppliedSHA      string    `json:"appliedSha"`
 	AheadBaselines  int       `json:"aheadBaselines"`
+	SnapshotBase    string    `json:"snapshotBase"`
 	TargetSHA       string    `json:"targetSha"`
 	Error           string    `json:"error"`
 	RestartRequired bool      `json:"restartRequired"`
@@ -67,7 +71,7 @@ func NewWebUI(rec *Reconciler, branch string) http.Handler {
 		st, applied, ahead := rec.Snapshot()
 		out := apiState{
 			Branch: branch, AppliedSHA: applied, AheadBaselines: ahead,
-			TargetSHA: st.TargetSHA, Error: st.Error,
+			TargetSHA: st.TargetSHA, SnapshotBase: st.SnapshotBase, Error: st.Error,
 			RestartRequired: st.RestartRequired, LastSync: st.LastSync,
 			Files: []apiFile{},
 		}
@@ -76,6 +80,9 @@ func NewWebUI(rec *Reconciler, branch string) http.Handler {
 				Rel: f.Rel, Kind: f.Kind, Token: f.Token, BaseSHA: f.BaseSHA,
 				Absent: [3]bool{f.Base == nil, f.Live == nil, f.Target == nil},
 				Rows:   f.Rows,
+			}
+			if f.BaseSHA == snapshotRef {
+				af.BaseSHA, af.BaseSnapshot = st.SnapshotBase, true
 			}
 			if f.Rel == secretsPlain {
 				af.Masked = true

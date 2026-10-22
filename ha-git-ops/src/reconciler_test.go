@@ -67,6 +67,7 @@ func newRig(t *testing.T) *rig {
 			CommitName: "ha-git-ops", CommitEmail: "ha@test"},
 		ha: ha, repoDir: filepath.Join(base, "repo"), configDir: live,
 		stateFile: filepath.Join(base, "state.json"), backupsDir: filepath.Join(base, "backups"),
+		snapshotDir: filepath.Join(base, "baseline"),
 	}
 	return &rig{t: t, r: r, sup: sup, work: filepath.Join(base, "work"), live: live, origin: filepath.Join(base, "origin.git")}
 }
@@ -211,7 +212,7 @@ func (g *rig) restart(change func(*Options)) {
 	g.t.Helper()
 	old := g.r
 	r := &Reconciler{opts: old.opts, ha: old.ha, repoDir: old.repoDir, configDir: old.configDir,
-		stateFile: old.stateFile, backupsDir: old.backupsDir}
+		stateFile: old.stateFile, backupsDir: old.backupsDir, snapshotDir: old.snapshotDir}
 	change(&r.opts)
 	if raw, err := os.ReadFile(r.stateFile); err == nil {
 		if err := json.Unmarshal(raw, &r.state); err != nil {
@@ -239,18 +240,33 @@ func (g *rig) notified(title string) bool {
 	return false
 }
 
+func (g *rig) kind(rel string) string {
+	g.t.Helper()
+	for _, f := range g.r.status.Files {
+		if f.Rel == rel {
+			return f.Kind
+		}
+	}
+	return ""
+}
+
 // The bug this guards: after moving the config to another repo, branch
-// and folder, the old clone kept fetching from the old origin and the
-// old baseline was diffed against the new paths.
-func TestRetargetToMovedConfig(t *testing.T) {
+// and folder, the old clone kept fetching from the old origin and the old
+// baseline was diffed against the new paths. Now the clone is replaced
+// and last-applied is carried over, so each file still reads as which
+// side actually changed.
+func TestMoveCarriesLastApplied(t *testing.T) {
 	g := newRig(t)
 	g.tick()
 	old := g.r.state.AppliedSHA
 
+	// The new home: a.yaml as HA has it, b.yaml moved ahead in git, and a
+	// GITOPS.md that never existed before the move.
 	base := filepath.Dir(g.work)
 	run(t, base, `git init -q --bare -b main moved.git && git init -q -b ha moved &&
 		cd moved && git config user.email t@t && git config user.name t && mkdir config &&
-		printf 'a1\na2\na3\n' > config/a.yaml && printf 'b1\nb2\nb3\n' > config/b.yaml &&
+		printf 'a1\na2\na3\n' > config/a.yaml && printf 'b1\nB2\n' > config/b.yaml &&
+		printf '# GitOps\n' > config/GITOPS.md &&
 		git add -A && git commit -qm moved && git push -q ../moved.git ha`)
 	g.restart(func(o *Options) {
 		o.RepoURL, o.Branch, o.Subfolder = filepath.Join(base, "moved.git"), "ha", "config"
@@ -263,22 +279,40 @@ func TestRetargetToMovedConfig(t *testing.T) {
 	if got := g.gitOut("sparse-checkout", "list"); got != "config" {
 		t.Fatalf("sparse = %s", got)
 	}
-	head := g.r.status.TargetSHA
+	st := g.r.state
 	want := targetID{RepoURL: filepath.Join(base, "moved.git"), Branch: "ha", Subfolder: "config"}
-	if g.r.state.AppliedSHA != head || head == old || g.r.state.Target == nil || *g.r.state.Target != want {
-		t.Fatalf("want baseline at new head with new target, got %+v", g.r.state)
+	if st.SnapshotBase != old || st.AppliedSHA != g.r.status.TargetSHA || st.Target == nil || *st.Target != want {
+		t.Fatalf("want snapshot from %.9s anchored at the new head, got %+v", old, st)
 	}
-	// Only b.yaml differs (live lacks b3), and against the new baseline it
-	// reads as a live change, not a full deletion plus a full addition.
-	if len(g.r.status.Files) != 1 || g.file("b.yaml").Kind != kindLive {
-		t.Fatalf("files = %+v", g.r.status.Files)
+	if string(g.file("b.yaml").Base) != "b1\nb2\n" {
+		t.Fatalf("b.yaml last-applied should be carried over, got %q", g.file("b.yaml").Base)
+	}
+	if k := g.kind("b.yaml"); k != kindTarget {
+		t.Fatalf("b.yaml moved ahead in git: kind %q", k)
+	}
+	if k := g.kind("GITOPS.md"); k != kindTarget || g.file("GITOPS.md").Base != nil {
+		t.Fatalf("GITOPS.md is new in the target: kind %q", k)
+	}
+	if k := g.kind("a.yaml"); k != "" {
+		t.Fatalf("a.yaml matches: kind %q", k)
 	}
 	if !g.notified("GitOps: target changed") {
 		t.Fatal("expected a target-changed notification")
 	}
+
+	// Converging every file retires the snapshot.
+	for _, rel := range []string{"b.yaml", "GITOPS.md"} {
+		f := g.file(rel)
+		if err := g.r.ApplyLive([]Picks{picksWhere(f, diff3.Live, diff3.Target)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if g.r.state.SnapshotBase != "" || len(g.r.snapshotRels()) != 0 || len(g.r.status.Files) != 0 {
+		t.Fatalf("snapshot should be gone once in sync, got %+v", g.r.state)
+	}
 }
 
-func TestRetargetBranchOnly(t *testing.T) {
+func TestBranchChangeKeepsBaseline(t *testing.T) {
 	g := newRig(t)
 	g.tick()
 	old := g.r.state.AppliedSHA
@@ -286,14 +320,18 @@ func TestRetargetBranchOnly(t *testing.T) {
 		git commit -qam next && git push -q ../origin.git next`)
 	g.restart(func(o *Options) { o.Branch = "next" })
 	g.tick()
-	if g.r.state.AppliedSHA == old || g.r.state.AppliedSHA != g.r.status.TargetSHA || g.r.state.Target.Branch != "next" {
-		t.Fatalf("want baseline at next's head, got %+v", g.r.state)
+	if g.r.state.AppliedSHA != old || g.r.state.SnapshotBase != "" || g.r.state.Target.Branch != "next" {
+		t.Fatalf("same clone and paths: baseline should stay, got %+v", g.r.state)
+	}
+	if k := g.kind("b.yaml"); k != kindTarget {
+		t.Fatalf("b.yaml kind %q", k)
 	}
 }
 
-// State written before targets were recorded: a stale clone means the
-// options moved, a matching one keeps its baseline.
-func TestRetargetLegacyState(t *testing.T) {
+// State written before targets were recorded: a stale clone is carried
+// over using its own sparse checkout as the old subfolder; a matching
+// one keeps its baseline.
+func TestLegacyStateWithoutTarget(t *testing.T) {
 	g := newRig(t)
 	g.tick()
 	old := g.r.state.AppliedSHA
@@ -310,13 +348,31 @@ func TestRetargetLegacyState(t *testing.T) {
 		t.Fatalf("matching clone should keep its baseline, got %+v", g.r.state)
 	}
 
-	run(t, g.work, `mkdir -p ha2 && git mv ha/a.yaml ha2/a.yaml && printf 'b1\nb2\n' > ha2/b.yaml &&
+	run(t, g.work, `mkdir -p ha2 && git mv ha/a.yaml ha2/a.yaml && printf 'b1\nB2\n' > ha2/b.yaml &&
 		git add -A && git commit -qm move && git push -q ../origin.git main`)
 	legacy()
 	g.restart(func(o *Options) { o.Subfolder = "ha2" })
 	g.tick()
-	if g.r.state.AppliedSHA == old || g.gitOut("sparse-checkout", "list") != "ha2" {
-		t.Fatalf("stale legacy clone should re-clone and re-baseline, got %+v", g.r.state)
+	if g.r.state.SnapshotBase != old || g.gitOut("sparse-checkout", "list") != "ha2" || g.kind("b.yaml") != kindTarget {
+		t.Fatalf("stale legacy clone should carry its baseline over, got %+v files=%v", g.r.state, g.r.status.Files)
+	}
+}
+
+// With the old clone already gone, a subfolder move within the same repo
+// still carries over: the old commits are in the new clone.
+func TestMoveWithoutOldClone(t *testing.T) {
+	g := newRig(t)
+	g.tick()
+	old := g.r.state.AppliedSHA
+	run(t, g.work, `mkdir -p ha2 && git mv ha/a.yaml ha2/a.yaml && printf 'b1\nB2\n' > ha2/b.yaml &&
+		git add -A && git commit -qm move && git push -q ../origin.git main`)
+	if err := os.RemoveAll(g.r.repoDir); err != nil {
+		t.Fatal(err)
+	}
+	g.restart(func(o *Options) { o.Subfolder = "ha2" })
+	g.tick()
+	if g.r.state.SnapshotBase != old || g.kind("b.yaml") != kindTarget || g.kind("a.yaml") != "" {
+		t.Fatalf("want carried baseline, got %+v files=%v", g.r.state, g.r.status.Files)
 	}
 }
 
@@ -330,7 +386,22 @@ func TestLostCloneKeepsBaseline(t *testing.T) {
 	}
 	g.restart(func(*Options) {})
 	g.tick()
-	if g.r.state.AppliedSHA != old || g.file("b.yaml").Kind != kindTarget {
+	if g.r.state.AppliedSHA != old || g.r.state.SnapshotBase != "" || g.kind("b.yaml") != kindTarget {
 		t.Fatalf("a re-clone of the same target must keep the baseline, got %+v", g.r.state)
+	}
+}
+
+// The applied commit gone with nothing to carry over: start over like a
+// first run rather than fail every refresh.
+func TestUnreachableBaselineResets(t *testing.T) {
+	g := newRig(t)
+	g.tick()
+	if err := os.WriteFile(g.r.stateFile, []byte(`{"applied_sha":"0123456789abcdef0123456789abcdef01234567"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	g.restart(func(*Options) {})
+	g.tick()
+	if g.r.state.AppliedSHA != g.r.status.TargetSHA || !g.notified("GitOps: baseline reset") {
+		t.Fatalf("want a fresh baseline at head, got %+v", g.r.state)
 	}
 }

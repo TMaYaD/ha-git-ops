@@ -2,19 +2,25 @@
 
 ## 0.6.1
 
-- **Changing `repo_url`, `branch` or `subfolder` now takes effect.**
-  Previously the existing clone in `/data/repo` was reused as-is: it
-  kept fetching from the old origin with the old sparse checkout, and
-  the old last-applied baseline was diffed against the new paths — so a
-  moved config showed every file as deleted on one side and added on the
-  other. On start the add-on now replaces a clone that tracks a
-  different repo or subfolder, and when the target changes it
-  re-baselines at the new head exactly like a first run: nothing is
-  written, every difference shows in the panel, and a persistent
-  notification says so. The baseline's target is recorded in
-  `state.json`; state from earlier versions counts as moved when its
-  clone was stale. A clone that is merely missing is re-cloned without
-  touching the baseline.
+- **Changing `repo_url`, `branch` or `subfolder` now takes effect —
+  without losing last-applied.** Previously the existing clone in
+  `/data/repo` was reused as-is: it kept fetching from the old origin
+  with the old sparse checkout, and the old baseline was diffed against
+  the new paths, so a moved config showed every file as deleted on one
+  side and added on the other. On start the add-on now replaces a clone
+  that tracks a different repo or subfolder, after snapshotting each
+  file's last-applied content (raw from git, so `secrets.sops.yaml`
+  stays encrypted) to `/data/baseline`. The snapshot stands in as
+  last-applied until each file converges on the new target and is
+  deleted once all have — so after a move the panel still shows whether
+  git or HA changed a file, and a file new in the target reads as new
+  there. A persistent notification says the target changed.
+- A branch-only change keeps the baseline as is; a clone that is merely
+  missing is re-cloned without touching it. Only when the applied commit
+  is unreachable with nothing to carry over does the add-on baseline
+  afresh at the new head (writing nothing, with a notification).
+- The target the baseline belongs to is recorded in `state.json`; state
+  from earlier versions is carried over when its clone was stale.
 - A leading or trailing `/` in `subfolder` is ignored instead of
   breaking every git lookup.
 

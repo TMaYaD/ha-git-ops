@@ -8,9 +8,10 @@
    - `branch`, `poll_interval`, `auto_refresh`, `auto_apply`,
      `auto_restart_core` as you like
    - Changing `repo_url`, `branch` or `subfolder` later (say, after moving
-     the config to another repo) re-clones and re-baselines at the new
-     head on the next start — like a first run, nothing is written and
-     every difference shows in the panel.
+     the config to another repo) takes effect on the next start: the
+     clone is replaced and each file's last-applied is carried over until
+     it converges on the new target, so the panel still shows which side
+     changed what. Nothing is written.
    - `notify_drift`, `notify_service` — notifications for files awaiting
      a decision, and optional push routing (see Behavior below)
 2. Start it once. The log prints two public keys:
